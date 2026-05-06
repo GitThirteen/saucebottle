@@ -1,0 +1,51 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "saucebottle",
+  "version": "1.0.0",
+  "identifier": "com.thirteenlabs.saucebottle",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "SauceBottle",
+        "width": 400,
+        "height": 700,
+        "resizable": false,
+        "maximizable": false,
+        "fullscreen": false,
+        "alwaysOnTop": true
+      }
+    ],
+    "security": {
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["**"]
+      },
+      "csp": "default-src 'self'; script-src 'self'; connect-src 'none'; img-src 'self' asset: tauri:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEM0NjE5OEZEOEYyM0FFRkQKUldUOXJpT1AvWmhoeEY5TVdGakxUc1VSVmRQTUNCRHBFKzV2QzN6MFBxd3U0R0diekRraHFUMUwK",
+      "endpoints": [
+        "https://github.com/GitThirteen/saucebottle/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}

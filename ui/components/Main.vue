@@ -1,0 +1,630 @@
+<script setup lang="ts">
+import { ref, watch, onUnmounted, computed } from 'vue';
+import { DropletIcon, AlertTriangleIcon, DownloadCloudIcon } from 'lucide-vue-next';
+import { 
+  appState, 
+  queueCount, 
+  activeImage, 
+  resultData, 
+  errorMessage, 
+  loadingMessage, 
+  isRareMessage, 
+  offlineQueueCount, 
+  isPermanentScan,
+  updateStatus,
+  updateProgress
+} from '../store';
+
+// ---------------------------------*
+// ---- LOCAL STATE (UPDATER) ------*
+// ---------------------------------*
+
+const tips = [
+  "Tip: Pin your '/input' folder to your OS Quick Access for faster drag-and-drops!",
+  "Tip: You can adjust the invalid match threshold in the Settings tab.",
+  "Tip: SauceBottle ignores files that aren't valid images, so don't worry about text files.",
+  "Tip: Turn on 'Apply modifications to saved file' to save disk space on massive images.",
+  "Tip: You can drag and drop folders into the input directory to scan everything inside."
+];
+
+const currentTip = ref(tips[0]);
+let tipInterval: number;
+
+// ---------------------------------*
+// ---- COMPUTED & WATCHERS --------*
+// ---------------------------------*
+
+/**
+ * Dynamically assigns a color class to the match confidence badge based on the IQDB score.
+ */
+const badgeClass = computed(() => {
+  if (resultData.value.conf < 65) return 'badge-red';
+  if (resultData.value.conf < 85) return 'badge-yellow';
+  return 'badge-green';
+});
+
+/**
+ * Watches the global appState. When it switches to 'updating', it starts rotating
+ * through the helpful tips every 4.5 seconds to keep the user entertained.
+ */
+watch(() => appState.value, (newState) => {
+  if (newState === 'updating') {
+    let index = 0;
+    tipInterval = window.setInterval(() => {
+      index = (index + 1) % tips.length;
+      currentTip.value = tips[index];
+    }, 4500); 
+  } else {
+    clearInterval(tipInterval);
+  }
+});
+
+// ---------------------------------*
+// ---- LIFECYCLE ------------------*
+// ---------------------------------*
+
+onUnmounted(() => {
+  clearInterval(tipInterval);
+});
+
+// ---------------------------------*
+// ---- METHODS --------------------*
+// ---------------------------------*
+
+/**
+ * Fallback handler if the processing image gets deleted or corrupted before rendering.
+ */
+const handleImageError = () => {
+  if (appState.value !== 'welcome') {
+    appState.value = 'welcome';
+  }
+};
+</script>
+
+<template>
+  <div class="main-view">
+    <transition name="fade" mode="out-in">
+      
+      <div v-if="appState === 'welcome'" class="welcome-card unselectable">
+        <div class="icon-ring organic-blob">
+          <DropletIcon :size="32" class="organic-icon" fill="currentColor" />
+        </div>
+        <h2>Ready to Sort</h2>
+        <p>Drop images into your <code>/input</code> folder.<br>SauceBottle will identify and categorize them {{ isPermanentScan ? "automatically" : "when you press Run" }}.</p>
+
+        <div v-if="offlineQueueCount > 0" class="paused-queue-badge">
+          <span class="pulse paused-pulse"></span>
+          {{ offlineQueueCount }} {{ offlineQueueCount === 1 ? "image" : "images" }} ready
+        </div>
+      </div>
+
+      <div v-else-if="appState === 'updating'" class="update-panel processing-card">
+        <div class="update-content">
+          <DownloadCloudIcon :size="56" class="update-icon pulse-anim" />
+          
+          <h3 class="update-title">Updating SauceBottle</h3>
+          <p class="update-status">{{ updateStatus }}</p>
+          
+          <div class="progress-container">
+            <div class="progress-track-large">
+              <div class="progress-bar-fill" :style="{ width: updateProgress + '%' }"></div>
+            </div>
+            <span class="progress-text">{{ updateProgress }}%</span>
+          </div>
+
+          <div class="tips-box unselectable">
+            <transition name="fade" mode="out-in">
+              <p :key="currentTip" class="tip-text">{{ currentTip }}</p>
+            </transition>
+          </div>
+        </div>
+      </div>
+
+      <div v-else class="processing-card">
+        
+        <div class="queue-status unselectable">
+          <span class="pulse"></span> {{ queueCount }} {{ queueCount === 1 ? "image" : "images" }} in queue
+        </div>
+        
+        <div class="image-wrapper unselectable">
+          <img :src="activeImage" alt="Current Image" @error="handleImageError" />
+        </div>
+
+        <transition name="panel-slide" mode="out-in">
+          
+          <div v-if="appState === 'processing'" class="loader-panel">
+            <h3 class="loader-text" :class="{ 'rainbow-text': isRareMessage }">
+              <template v-if="isRareMessage">
+                <span 
+                  v-for="(char, idx) in loadingMessage" 
+                  :key="idx" 
+                  class="wave-char" 
+                  :style="{ animationDelay: `${idx * 0.05}s` }"
+                >{{ char }}</span>
+              </template>
+              <template v-else>{{ loadingMessage }}</template>
+            </h3>
+
+            <div class="progress-track">
+              <div class="progress-bar"></div>
+            </div>
+          </div>
+
+          <div v-else-if="appState === 'result'" class="info-panel">
+            <p class="identified-text" v-if="resultData.name === 'Original' && (resultData.fandom === 'Original' || resultData.fandom === 'Unknown')">
+              Identified as <span class="highlight">Original</span><br>
+              made by <span class="fandom">{{ resultData.artist !== 'Unknown' ? resultData.artist : 'Anon' }}</span>
+            </p>
+            <p class="identified-text" v-else>
+              Identified as <span class="highlight">{{ resultData.name }}</span><br>
+              from <span class="fandom">{{ resultData.fandom }}</span>
+            </p>
+            
+            <div class="badge-row">
+              <span class="unselectable confidence-badge" :class="badgeClass">{{ resultData.conf }}% Match</span>
+              <span class="unselectable service-source">{{ resultData.service }}</span>
+            </div>
+            
+            <div class="destination-box">
+              <span class="icon">📁</span>
+              <code class="path">{{ resultData.dest }}</code>
+            </div>
+          </div>
+
+          <div v-else-if="appState === 'error'" class="error-panel">
+            <AlertTriangleIcon :size="42" class="error-icon unselectable" />
+            <h3 class="error-title">Processing Failed</h3>
+            <p class="error-message">{{ errorMessage }}</p>
+          </div>
+
+        </transition>
+      </div>
+    </transition>
+  </div>
+</template>
+
+<style scoped>
+.main-view { 
+  padding: 20px; 
+  display: flex; 
+  flex-direction: column; 
+  gap: 20px; 
+  box-sizing: border-box; 
+  height: 100%; 
+  justify-content: center; 
+}
+
+/* -- UPDATER SCREEN -- */
+.update-panel {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  min-height: 400px;
+}
+
+.update-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 80%;
+}
+
+.update-icon {
+  color: var(--accent-primary);
+  margin-bottom: 20px;
+}
+
+.update-title {
+  margin: 0 0 5px 0;
+  font-size: 1.4rem;
+  color: var(--text-primary);
+  font-weight: 800;
+}
+
+.update-status {
+  margin: 0 0 35px 0;
+  font-size: 0.9rem;
+  color: var(--text-secondary);
+  font-family: monospace;
+}
+
+.progress-container {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 45px;
+}
+
+.progress-track-large {
+  width: 100%;
+  height: 10px;
+  background: var(--bg-base);
+  border-radius: 6px;
+  overflow: hidden;
+  border: 1px solid var(--bg-surface-elevated);
+}
+
+.progress-bar-fill {
+  height: 100%;
+  background: var(--accent-gradient);
+  border-radius: 6px;
+  transition: width 0.3s ease;
+}
+
+.progress-text {
+  font-size: 0.85rem;
+  font-weight: 800;
+  color: var(--text-tertiary);
+  align-self: flex-end;
+}
+
+.tips-box {
+  background: rgba(0, 0, 0, 0.15);
+  border: 1px dashed var(--bg-surface-elevated);
+  padding: 15px 25px;
+  border-radius: 8px;
+  width: 100%;
+  min-height: 52px; 
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+.tip-text {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  line-height: 1.4;
+  font-style: italic;
+}
+
+/* -- WELCOME SCREEN -- */
+.welcome-card { 
+  background: var(--bg-surface); 
+  border-radius: 16px; 
+  padding: 40px 20px; 
+  text-align: center; 
+  box-shadow: 0 8px 30px rgba(0,0,0,0.3); 
+  border: 1px dashed var(--bg-surface-elevated); 
+  display: flex; 
+  flex-direction: column; 
+  align-items: center; 
+  justify-content: center; 
+}
+
+.icon-ring { 
+  width: 70px; 
+  height: 70px; 
+  border-radius: 50%; 
+  background: rgba(255, 75, 43, 0.1); 
+  display: flex; 
+  align-items: center; 
+  justify-content: center; 
+  margin-bottom: 20px; 
+  border: 1px solid rgba(255, 75, 43, 0.2); 
+}
+
+.sparkle-icon { 
+  color: var(--accent-primary); 
+  animation: float 3s ease-in-out infinite; 
+}
+
+.welcome-card h2 { 
+  margin: 0 0 10px 0; 
+  color: var(--text-primary); 
+  font-size: 1.5rem; 
+}
+
+.welcome-card p { 
+  color: var(--text-secondary); 
+  font-size: 0.95rem; 
+  line-height: 1.5; 
+  margin: 0; 
+}
+
+.welcome-card code { 
+  background: var(--bg-base); 
+  padding: 2px 6px; 
+  border-radius: 4px; 
+  color: var(--text-primary); 
+  font-family: monospace; 
+  font-size: 0.85rem; 
+}
+
+/* -- PROCESSING CARD (Shared wrapper) -- */
+.processing-card { 
+  background: var(--bg-surface); 
+  border-radius: 12px; 
+  box-shadow: 0 8px 30px rgba(0,0,0,0.5); 
+  border: 1px solid var(--bg-surface-elevated); 
+}
+
+/* Top Status Bar & Image */
+.queue-status { 
+  padding: 10px; 
+  font-size: 0.8rem; 
+  color: var(--text-secondary); 
+  background: var(--bg-base); 
+  border-bottom: 1px solid var(--bg-surface-elevated); 
+  display: flex; 
+  align-items: center; 
+  gap: 8px; 
+  justify-content: center; 
+  font-weight: 700; 
+}
+
+.pulse { 
+  width: 8px; 
+  height: 8px; 
+  background: var(--accent-primary); 
+  border-radius: 50%; 
+  box-shadow: 0 0 8px var(--accent-primary); 
+  animation: pulse-anim 2s infinite; 
+}
+
+.image-wrapper { 
+  height: 260px; 
+  width: 100%; 
+  overflow: hidden; 
+  background: #000; 
+  display: flex; 
+  justify-content: center; 
+  align-items: center; 
+  border-bottom: 1px solid var(--bg-surface-elevated); 
+}
+
+.image-wrapper img { 
+  width: 100%; 
+  height: 100%; 
+  object-fit: cover; 
+  animation: subtle-zoom 10s infinite alternate linear; 
+}
+
+/* -- STATE 1: LOADER ANIMATION -- */
+.loader-panel { 
+  padding: 40px 30px; 
+  text-align: center; 
+}
+
+.loader-text { 
+  margin: 0 0 20px 0; 
+  font-size: 1.1rem; 
+  color: var(--accent-primary); 
+  font-weight: 800; 
+  letter-spacing: 1px; 
+  animation: pulse-text 1.5s infinite; 
+}
+
+.progress-track { 
+  height: 6px; 
+  background: var(--bg-base); 
+  border-radius: 4px; 
+  overflow: hidden; 
+  position: relative; 
+}
+
+.progress-bar { 
+  position: absolute; 
+  top: 0; 
+  left: 0; 
+  width: 40%; 
+  height: 100%; 
+  background: var(--accent-gradient); 
+  border-radius: 4px; 
+  animation: scan 1.2s infinite ease-in-out alternate; 
+}
+
+/* -- STATE 2: INFO PANEL -- */
+.info-panel { 
+  padding: 20px; 
+  text-align: center; 
+}
+
+.identified-text { 
+  margin: 0 0 10px 0; 
+  font-size: 1.2rem; 
+  color: var(--text-secondary); 
+}
+.identified-text .highlight { 
+  color: var(--text-primary); 
+  font-size: 1.4rem; 
+  font-weight: 800; 
+}
+.identified-text .fandom { 
+  font-size: 1rem; 
+  font-weight: 700; 
+}
+
+.badge-row { 
+  display: flex; 
+  justify-content: center; 
+  gap: 10px; 
+  margin-bottom: 20px; 
+}
+.confidence-badge { 
+  padding: 4px 12px; 
+  border-radius: 20px; 
+  font-size: 0.75rem; 
+  font-weight: 800; 
+}
+.badge-green { 
+  background: rgba(0, 230, 118, 0.15); 
+  color: #00e676; 
+  border: 1px solid rgba(0, 230, 118, 0.3); 
+}
+.badge-yellow { 
+  background: rgba(245, 197, 66, 0.15); 
+  color: #f5c542; 
+  border: 1px solid rgba(245, 197, 66, 0.3); 
+}
+.badge-red { 
+  background: rgba(255, 77, 77, 0.15); 
+  color: #ff4d4d; 
+  border: 1px solid rgba(255, 77, 77, 0.3); 
+}
+.service-source { 
+  background: var(--bg-base); 
+  color: var(--text-secondary); 
+  padding: 4px 12px; 
+  border-radius: 20px; 
+  font-size: 0.75rem; 
+  font-weight: 800; 
+  border: 1px solid var(--bg-surface-elevated); 
+}
+
+.destination-box { 
+  display: flex; 
+  align-items: center; 
+  gap: 10px; 
+  background: var(--bg-base); 
+  padding: 10px 15px; 
+  border-radius: 8px; 
+  border: 1px dashed var(--text-tertiary); 
+}
+.destination-box .path { 
+  font-family: monospace; 
+  color: var(--accent-primary); 
+  font-size: 0.85rem; 
+  font-weight: 700; 
+}
+
+/* -- STATE 3: ERROR PANEL -- */
+.error-panel { 
+  padding: 30px; 
+  text-align: center; 
+  display: flex; 
+  flex-direction: column; 
+  align-items: center; 
+}
+.error-icon { 
+  color: #ff4d4d; 
+  margin-bottom: 12px; 
+  animation: pulse-text 1.5s infinite; 
+}
+.error-title { 
+  margin: 0 0 10px 0; 
+  font-size: 1.2rem; 
+  color: #ff4d4d; 
+  font-weight: 800; 
+}
+.error-message { 
+  margin: 0; 
+  font-size: 0.85rem; 
+  color: var(--text-secondary); 
+  background: rgba(255, 77, 77, 0.1); 
+  padding: 12px 16px; 
+  border-radius: 8px; 
+  border: 1px dashed rgba(255, 77, 77, 0.3); 
+  word-break: break-word; 
+  line-height: 1.4; 
+  font-family: monospace; 
+  max-width: 90%; 
+}
+
+/* -- RARE EASTER EGG TEXT -- */
+.rainbow-text {
+  display: inline-block;
+  font-size: 1.4rem;
+  text-transform: uppercase;
+  white-space: pre-wrap;
+}
+
+.wave-char {
+  display: inline-block;
+  color: #ff4d4d;
+  animation: mexican-wave 1.2s ease-in-out infinite, color-shift 2.5s linear infinite;
+}
+
+@keyframes color-shift {
+  0% { filter: hue-rotate(0deg) saturate(1.5); }
+  100% { filter: hue-rotate(360deg) saturate(1.5); }
+}
+
+@keyframes mexican-wave {
+  0%, 40%, 100% { transform: translateY(0); }
+  20% { transform: translateY(-8px); }
+}
+
+/* -- PAUSED BADGE -- */
+.paused-queue-badge {
+  margin-top: 25px;
+  background: rgba(245, 197, 66, 0.15);
+  color: #f5c542;
+  padding: 10px 20px;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 800;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid rgba(245, 197, 66, 0.3);
+  animation: pop 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+
+.paused-pulse {
+  background: #f5c542;
+  box-shadow: 0 0 8px #f5c542;
+}
+
+/* -- BLOB ANIMATION -- */
+.organic-blob {
+  animation: blob-morph 5s ease-in-out infinite alternate;
+  background: rgba(255, 75, 43, 0.1);
+  border: 1px solid rgba(255, 75, 43, 0.2);
+}
+
+.organic-icon {
+  color: var(--accent-primary);
+  animation: liquid-sway 4s ease-in-out infinite;
+}
+
+@keyframes blob-morph {
+   0% { border-radius: 50%; }
+   50% { border-radius: 60% 40% 40% 60% / 50% 60% 40% 50%; }
+   100% { border-radius: 40% 60% 60% 40% / 60% 40% 50% 50%; }
+}
+
+@keyframes liquid-sway {
+  0%, 100% { transform: translateY(0px) scale(1) rotate(0deg); }
+  33% { transform: translateY(-4px) scale(1.05) rotate(4deg); }
+  66% { transform: translateY(-2px) scale(0.95) rotate(-4deg); }
+}
+
+/* -- ANIMATIONS & TRANSITIONS -- */
+@keyframes float { 
+  0% { transform: translateY(0px); } 
+  50% { transform: translateY(-8px); } 
+  100% { transform: translateY(0px); } 
+}
+@keyframes pulse-anim { 
+  0% { opacity: 1; transform: scale(1); } 
+  50% { opacity: 0.5; transform: scale(1.2); } 
+  100% { opacity: 1; transform: scale(1); } 
+}
+@keyframes pulse-text { 
+  0%, 100% { opacity: 1; } 
+  50% { opacity: 0.6; } 
+}
+@keyframes scan { 
+  0% { transform: translateX(-100%); } 
+  100% { transform: translateX(250%); } 
+}
+@keyframes subtle-zoom { 
+  0% { transform: scale(1); } 
+  100% { transform: scale(1.05); } 
+}
+@keyframes pop { 
+  0% { transform: scale(0.85); opacity: 0; } 
+  100% { transform: scale(1); opacity: 1; } 
+}
+
+.fade-enter-active, .fade-leave-active { transition: opacity 0.3s ease; }
+.fade-enter-from, .fade-leave-to { opacity: 0; }
+
+.panel-slide-enter-active, .panel-slide-leave-active { transition: all 0.3s ease; }
+.panel-slide-enter-from { opacity: 0; transform: translateY(10px); }
+.panel-slide-leave-to { opacity: 0; transform: translateY(-10px); }
+</style>

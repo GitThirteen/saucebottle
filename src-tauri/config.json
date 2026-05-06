@@ -1,0 +1,58 @@
+{
+  "services": {
+    "Yande.re": {
+      "url": "https://yande.re/post.json?tags=id:${ID}",
+      "post_url": null
+    },
+    "Gelbooru": {
+      "url": "https://gelbooru.com/index.php?page=dapi&s=post&q=index&id=${ID}&json=1&user_id=${USERNAME}&api_key=${API_KEY}",
+      "post_url": "https://gelbooru.com/index.php?page=dapi&s=tag&q=index&names=${TAGS}&json=1&user_id=${USERNAME}&api_key=${API_KEY}"
+    },
+    "Danbooru": {
+      "url": "https://danbooru.donmai.us/posts/${ID}.json?login=${USERNAME}&api_key=${API_KEY}",
+      "post_url": null
+    }
+  },
+  "flags": {
+    "listDupes": true,
+    "allowImageConversion": true,
+    "applyModsToSaved": false,
+    "isPermanentScan": true,
+    "allowResizing": true,
+    "allowShrinking": true,
+    "renameFoundImages": true,
+    "renameInvalidImages": true
+  },
+  "output_folder": "",
+  "original_folder": ".original",
+  "invalid_folder": ".invalid",
+  "blacklist": "",
+  "rename_behavior": "site_id",
+  "duplicate_behavior": "rename_copy",
+  "confidence_threshold": 80,
+  "active_hierarchy": [
+    {
+      "id": 1,
+      "name": "Fandom"
+    },
+    {
+      "id": 2,
+      "name": "Character"
+    }
+  ],
+  "available_blocks": [
+    {
+      "id": 3,
+      "name": "Artist"
+    },
+    {
+      "id": 5,
+      "name": "Rating (SFW/NSFW)"
+    },
+    {
+      "id": 4,
+      "name": "Year"
+    }
+  ],
+  "downloads_folder": ".downloads"
+}
