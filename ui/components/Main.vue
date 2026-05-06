@@ -37,19 +37,12 @@ let tipInterval: number;
 // ---- COMPUTED & WATCHERS --------*
 // ---------------------------------*
 
-/**
- * Dynamically assigns a color class to the match confidence badge based on the IQDB score.
- */
 const badgeClass = computed(() => {
   if (resultData.value.conf < 65) return 'badge-red';
   if (resultData.value.conf < 85) return 'badge-yellow';
   return 'badge-green';
 });
 
-/**
- * Watches the global appState. When it switches to 'updating', it starts rotating
- * through the helpful tips every 4.5 seconds to keep the user entertained.
- */
 watch(() => appState.value, (newState) => {
   if (newState === 'updating') {
     let index = 0;

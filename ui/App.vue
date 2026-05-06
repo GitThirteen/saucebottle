@@ -113,7 +113,7 @@ const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 /**
  * Initiates the app boot sequence.
- * Forces the UI into the 'updating' loading screen for a minimum of 5 seconds while
+ * Forces the UI into the 'updating' loading screen for a minimum of 7.5 seconds while
  * concurrently checking GitHub for a new release.
  */
 const runBootSequence = async () => {
