@@ -1,6 +1,6 @@
 <svg
-  viewBox="0 0 660 70"
-  width="660"
+  viewBox="0 0 350 70"
+  width="350"
   height="70"
   xmlns="http://www.w3.org/2000/svg">
   <defs>
@@ -20,5 +20,5 @@
       <stop offset="100%" style="stop-color:#ff416c"/>
     </linearGradient>
   </defs>
-  <text x="10" y="56" fill="url(#grad)">AUCEBOTTLE</text>
+  <text x="0" y="56" fill="url(#grad)">AUCEBOTTLE</text>
 </svg>
