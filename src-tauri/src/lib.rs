@@ -536,12 +536,11 @@ pub fn run() {
     );
     #[cfg(target_os = "macos")]
     keyring_core::set_default_store(
-        apple_native_keyring_store::Store::new().expect("Failed to init Apple Credential Manager"),
+        apple_native_keyring_store::keychain::Store::new().expect("Failed to init Apple Credential Manager"),
     );
     #[cfg(target_os = "linux")]
     keyring_core::set_default_store(
-        dbus_secret_service_keyring_store::Store::new()
-            .expect("Failed to init Linux Secret Service"),
+        dbus_secret_service_keyring_store::Store::new().expect("Failed to init Linux Secret Service"),
     );
 
     let config_data = fs::read_to_string("./config.json").unwrap_or_else(|_| "{}".to_string());
