@@ -17,7 +17,7 @@ pub struct HierarchyBlock {
     pub name: String,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct AppConfig {
     pub services: HashMap<String, BooruConfig>,
@@ -40,6 +40,65 @@ pub struct AppConfig {
 
     #[serde(default)]
     pub downloads_folder: String,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        let mut services = HashMap::new();
+        
+        services.insert("Gelbooru".to_string(), BooruConfig {
+            url: "https://gelbooru.com/index.php?page=dapi&s=post&q=index&id=${ID}&json=1&user_id=${USERNAME}&api_key=${API_KEY}".to_string(),
+            post_url: Some("https://gelbooru.com/index.php?page=dapi&s=tag&q=index&names=${TAGS}&json=1&user_id=${USERNAME}&api_key=${API_KEY}".to_string()),
+        });
+        
+        services.insert("Yande.re".to_string(), BooruConfig {
+            url: "https://yande.re/post.json?tags=id:${ID}".to_string(),
+            post_url: None,
+        });
+        
+        services.insert("Danbooru".to_string(), BooruConfig {
+            url: "https://danbooru.donmai.us/posts/${ID}.json?login=${USERNAME}&api_key=${API_KEY}".to_string(),
+            post_url: None,
+        });
+
+        let mut flags = HashMap::new();
+        flags.insert("applyModsToSaved".to_string(), false);
+        flags.insert("runOnBoot".to_string(), false);
+        flags.insert("listDupes".to_string(), true);
+        flags.insert("allowImageConversion".to_string(), true);
+        flags.insert("allowShrinking".to_string(), true);
+        flags.insert("renameFoundImages".to_string(), true);
+        flags.insert("renameInvalidImages".to_string(), true);
+        flags.insert("isPermanentScan".to_string(), true);
+        flags.insert("allowResizing".to_string(), true);
+        flags.insert("autoUpdateEnabled".to_string(), true);
+
+        let active_hierarchy = vec![
+            HierarchyBlock { id: 1, name: "Fandom".to_string() },
+            HierarchyBlock { id: 2, name: "Character".to_string() },
+        ];
+
+        let available_blocks = vec![
+            HierarchyBlock { id: 3, name: "Artist".to_string() },
+            HierarchyBlock { id: 5, name: "Rating (SFW/NSFW)".to_string() },
+            HierarchyBlock { id: 4, name: "Year".to_string() },
+        ];
+
+        Self {
+            services,
+            flags,
+            output_folder: "".to_string(),
+            original_folder: ".original".to_string(),
+            invalid_folder: ".invalid".to_string(),
+            blacklist: "".to_string(),
+            rename_behavior: "site_id".to_string(),
+            duplicate_behavior: "rename_copy".to_string(),
+            confidence_threshold: 80,
+            active_hierarchy,
+            available_blocks,
+            downloads_folder: ".downloads".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

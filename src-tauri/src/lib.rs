@@ -78,13 +78,35 @@ fn get_config(state: tauri::State<'_, AppState>) -> Result<AppConfig, String> {
 /// # Arguments
 /// * `config` - The updated `AppConfig` object from the frontend.
 /// * `state` - The managed Tauri application state.
+/// * `handle` - The Tauri app handle.
 ///
 /// # Returns
 /// * `Result<(), String>` - Success or an error string if disk writing fails.
 #[tauri::command]
-fn save_config(config: AppConfig, state: tauri::State<'_, AppState>) -> Result<(), String> {
+fn save_config(
+    config: AppConfig, 
+    state: tauri::State<'_, AppState>, 
+    handle: tauri::AppHandle
+) -> Result<(), String> {
+    use tauri::Manager;
+    use tauri_plugin_autostart::ManagerExt;
+    
     let data = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
-    fs::write("./config.json", data).map_err(|e| e.to_string())?;
+    
+    let config_dir = handle.path().app_config_dir().map_err(|e| e.to_string())?;
+    fs::create_dir_all(&config_dir).map_err(|e| e.to_string())?;
+    
+    let config_path = config_dir.join("config.json");
+    fs::write(config_path, data).map_err(|e| e.to_string())?;
+
+    let run_on_boot = config.flags.get("runOnBoot").copied().unwrap_or(false);
+    let autolaunch = handle.autolaunch();
+    
+    if run_on_boot {
+        let _ = autolaunch.enable();
+    } else {
+        let _ = autolaunch.disable();
+    }
 
     *state.config.lock().unwrap() = config;
     Ok(())
@@ -543,13 +565,8 @@ pub fn run() {
         dbus_secret_service_keyring_store::Store::new().expect("Failed to init Linux Secret Service"),
     );
 
-    let config_data = std::fs::read_to_string("./config.json").unwrap_or_else(|_| "{}".to_string());
-    let config: AppConfig = serde_json::from_str(&config_data).unwrap_or_default();
-
-    let is_permanently_scanning = config.flags.get("isPermanentScan").copied().unwrap_or(true);
-    let scan_active_flag = Arc::new(std::sync::atomic::AtomicBool::new(is_permanently_scanning));
-
-    let live_config = Arc::new(Mutex::new(config));
+    let scan_active_flag = Arc::new(std::sync::atomic::AtomicBool::new(false)); 
+    let live_config = Arc::new(Mutex::new(AppConfig::default()));
     let api_client = Arc::new(ApiClient::new(live_config.clone()));
 
     tauri::Builder::default()
@@ -562,7 +579,6 @@ pub fn run() {
             Some(vec![]),
         ))
         .invoke_handler(tauri::generate_handler![
-            // [TODO] Command registering list from hell -- perhaps find a sleeker way to register them (or at least not here)
             set_scan_state,
             get_config,
             save_config,
@@ -585,6 +601,34 @@ pub fn run() {
         })
         .setup(move |app| {
             use tauri::Manager;
+            use tauri_plugin_autostart::ManagerExt;
+            
+            let config_dir = app.path().app_config_dir().expect("Failed to resolve config dir");
+            std::fs::create_dir_all(&config_dir).expect("Failed to create config dir");
+            let config_path = config_dir.join("config.json");
+
+            let config: AppConfig = if config_path.exists() {
+                let config_data = std::fs::read_to_string(&config_path).unwrap_or_default();
+                serde_json::from_str(&config_data).unwrap_or_default()
+            } else {
+                let default_config = AppConfig::default();
+                if let Ok(json) = serde_json::to_string_pretty(&default_config) {
+                    let _ = std::fs::write(&config_path, json);
+                }
+                default_config
+            };
+
+            let is_permanently_scanning = config.flags.get("isPermanentScan").copied().unwrap_or(true);
+            scan_active_flag.store(is_permanently_scanning, std::sync::atomic::Ordering::Relaxed);
+            *live_config.lock().unwrap() = config.clone();
+
+            let run_on_boot = config.flags.get("runOnBoot").copied().unwrap_or(false);
+            let autolaunch = app.autolaunch();
+            if run_on_boot {
+                let _ = autolaunch.enable();
+            } else {
+                let _ = autolaunch.disable();
+            }
             
             let pic_dir = app.path().picture_dir().expect("Failed to resolve Pictures directory");
             let saucebottle_dir = pic_dir.join("SauceBottle");
