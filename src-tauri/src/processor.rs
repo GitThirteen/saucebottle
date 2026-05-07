@@ -36,11 +36,11 @@ fn sanitize_filename(name: &str) -> String {
 ///
 /// # Returns
 /// * `Result<ImageInfo, String>` - A populated metadata struct, or an error if the file is corrupt/unreadable.
-pub fn process_image(path: PathBuf) -> Result<ImageInfo, String> {
-    let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
+pub fn process_image(path: &Path) -> Result<ImageInfo, String> {
+    let metadata = fs::metadata(path).map_err(|e| e.to_string())?;
     let size_kb = metadata.len() / 1024;
 
-    let reader = ImageReader::open(&path)
+    let reader = ImageReader::open(path)
         .map_err(|e| e.to_string())?
         .with_guessed_format()
         .map_err(|e| format!("Failed to read image headers: {}", e))?;
@@ -316,13 +316,13 @@ pub fn move_to_invalid(
     if base_dir.as_os_str().is_empty() {
         base_dir = default_base_dir.to_path_buf();
     }
-    
+
     let folder_name = if config.invalid_folder.trim().is_empty() {
         ".invalid"
     } else {
         config.invalid_folder.trim()
     };
-    
+
     base_dir = base_dir.join(folder_name);
 
     fs::create_dir_all(&base_dir).map_err(|e| e.to_string())?;

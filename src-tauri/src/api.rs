@@ -164,12 +164,12 @@ fn clean_tag(tag: &str) -> String {
 // ---- API Interactions --------------*
 
 pub struct ApiClient {
-    config: Arc<Mutex<AppConfig>>,
+    config: Arc<Mutex<Arc<AppConfig>>>,
     client: reqwest::Client,
 }
 
 impl ApiClient {
-    pub fn new(config: Arc<Mutex<AppConfig>>) -> Self {
+    pub fn new(config: Arc<Mutex<Arc<AppConfig>>>) -> Self {
         Self {
             config,
             client: reqwest::Client::new(),
@@ -179,9 +179,9 @@ impl ApiClient {
     /// Retrieves a cloned reference to the active application configuration.
     ///
     /// # Returns
-    /// * `Arc<Mutex<AppConfig>>` - A thread-safe config object clone.
-    pub fn config(&self) -> Arc<Mutex<AppConfig>> {
-        self.config.clone()
+    /// * `Arc<AppConfig>` - A cloned reference to the config object.
+    pub fn config(&self) -> Arc<AppConfig> {
+        self.config.lock().unwrap().clone()
     }
 
     /// Checks the native OS credential manager to determine which services
@@ -256,7 +256,7 @@ impl ApiClient {
             .map_err(|e| e.to_string())?;
 
         let html_content = res.text().await.map_err(|e| e.to_string())?;
-        let threshold = self.config.lock().unwrap().confidence_threshold;
+        let threshold = self.config().confidence_threshold;
 
         let (service, id, similarity) =
             self.parse_iqdb_html(&html_content, active_services, threshold)?;
@@ -289,7 +289,7 @@ impl ApiClient {
         // [TODO] Reworking the if / else if / else if further at the bottom that handles each service individually (surely there must be a way to handle that better...)
         // [TODO] IQDB supports more services than just the current 3 *puts gun in mouth* (Traits???????)
 
-        let live_cfg = self.config.lock().unwrap().clone();
+        let live_cfg = self.config();
         let cfg = live_cfg
             .services
             .get(service)
@@ -561,7 +561,7 @@ impl ApiClient {
                             && valid_lower.contains(&srv.to_lowercase())
                             && best_match.as_ref().is_none_or(|t| similarity > t.2)
                         {
-                            best_match = Some((srv.clone(), id, similarity));
+                            best_match = Some((srv, id, similarity));
                         }
                     }
                 }

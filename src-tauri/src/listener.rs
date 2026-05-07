@@ -56,7 +56,7 @@ async fn process_single_file(
         return;
     }
 
-    let config_snapshot = client.config().lock().unwrap().clone();
+    let config_snapshot = client.config();
 
     let default_results_dir = handle
         .path()
@@ -65,17 +65,17 @@ async fn process_single_file(
         .join("SauceBottle")
         .join("results");
 
+    // keep this alive for as long as `invalid_folder`
+    let invalid_folder_temp;
     let invalid_folder = if config_snapshot.invalid_folder.trim().is_empty() {
-        default_results_dir
-            .join(".invalid")
-            .to_string_lossy()
-            .into_owned()
+        invalid_folder_temp = default_results_dir.join(".invalid");
+        invalid_folder_temp.to_string_lossy()
     } else {
-        config_snapshot.invalid_folder.clone()
+        (&config_snapshot.invalid_folder).into()
     };
 
     let process_result = async {
-        let info = processor::process_image(path.clone())?;
+        let info = processor::process_image(&path)?;
 
         let ext = path
             .extension()
@@ -103,10 +103,9 @@ async fn process_single_file(
         let _ = handle.emit("image-processing", info.clone());
 
         let payload = processor::get_iqdb_payload(&path, &info, &config_snapshot)?;
-        let payload_bytes = payload.clone();
 
         let mut booru_data = client
-            .search_iqdb(payload, &active_services, &handle)
+            .search_iqdb(payload.clone(), &active_services, &handle)
             .await?;
 
         let mut ext = path
@@ -138,19 +137,19 @@ async fn process_single_file(
             &booru_data,
             &ext,
             &config_snapshot,
-            Some(&payload_bytes),
+            Some(&payload),
             &default_results_dir,
         )?;
 
         // Populate a clean display path (e.g. "Arknights/Yvonne/D12345.png")
         let output_base = if config_snapshot.output_folder.trim().is_empty() {
-            default_results_dir.to_string_lossy().into_owned()
+            default_results_dir.to_string_lossy()
         } else {
-            config_snapshot.output_folder.clone()
+            (&config_snapshot.output_folder).into()
         };
         let clean_full = new_p.to_string_lossy().replace("\\\\?\\", "");
         let display_path = clean_full
-            .strip_prefix(&output_base)
+            .strip_prefix(&*output_base)
             .unwrap_or(&clean_full)
             .trim_start_matches(['/', '\\'])
             .replace('\\', "/");

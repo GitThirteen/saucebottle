@@ -30,7 +30,7 @@ struct AppState {
     is_active: Arc<AtomicBool>,
     queue_tx: std::sync::mpsc::Sender<(PathBuf, bool)>,
     queued_tracker: Arc<Mutex<HashSet<PathBuf>>>,
-    config: Arc<Mutex<AppConfig>>,
+    config: Arc<Mutex<Arc<AppConfig>>>,
 }
 
 #[derive(serde::Serialize)]
@@ -67,9 +67,9 @@ fn set_scan_state(active: bool, state: tauri::State<'_, AppState>, handle: tauri
 /// * `state` - The managed Tauri application state.
 ///
 /// # Returns
-/// * `Result<AppConfig, String>` - A clone of the current configuration.
+/// * `Result<Arc<AppConfig>, String>` - A clone of the current configuration.
 #[tauri::command]
-fn get_config(state: tauri::State<'_, AppState>) -> Result<AppConfig, String> {
+fn get_config(state: tauri::State<'_, AppState>) -> Result<Arc<AppConfig>, String> {
     Ok(state.config.lock().unwrap().clone())
 }
 
@@ -90,7 +90,7 @@ fn save_config(config: AppConfig, state: tauri::State<'_, AppState>) -> Result<(
 
     fs::write(config_path, data).map_err(|e| e.to_string())?;
 
-    *state.config.lock().unwrap() = config;
+    *Arc::make_mut(&mut state.config.lock().unwrap()) = config;
     Ok(())
 }
 
@@ -458,9 +458,9 @@ async fn download_image(
 
     // Use user setting or fallback to .downloads
     let dl_folder_name = if config.downloads_folder.trim().is_empty() {
-        ".downloads".to_string()
+        ".downloads"
     } else {
-        config.downloads_folder.clone()
+        &config.downloads_folder
     };
 
     let dl_dir = base_dir.join(dl_folder_name);
@@ -508,9 +508,9 @@ fn open_system_folder(
     // Append the downloads folder if requested
     if folder_target == "downloads" {
         let dl_folder = if config.downloads_folder.trim().is_empty() {
-            ".downloads".to_string()
+            ".downloads"
         } else {
-            config.downloads_folder
+            &config.downloads_folder
         };
         target_dir = target_dir.join(dl_folder);
     }
@@ -577,7 +577,7 @@ pub fn run() {
     let is_permanently_scanning = config.flags.get("isPermanentScan").copied().unwrap_or(true);
     let scan_active_flag = Arc::new(std::sync::atomic::AtomicBool::new(is_permanently_scanning));
 
-    let live_config = Arc::new(Mutex::new(config));
+    let live_config = Arc::new(Mutex::new(Arc::new(config)));
     let api_client = Arc::new(ApiClient::new(live_config.clone()));
 
     tauri::Builder::default()
