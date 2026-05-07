@@ -2,9 +2,9 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
+use image::ImageReader;
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
-use image::ImageReader;
 
 use crate::models::{AppConfig, BooruResponse, ImageInfo};
 
@@ -36,11 +36,11 @@ fn sanitize_filename(name: &str) -> String {
 ///
 /// # Returns
 /// * `Result<ImageInfo, String>` - A populated metadata struct, or an error if the file is corrupt/unreadable.
-pub fn process_image(path: PathBuf) -> Result<ImageInfo, String> {
-    let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
+pub fn process_image(path: &Path) -> Result<ImageInfo, String> {
+    let metadata = fs::metadata(path).map_err(|e| e.to_string())?;
     let size_kb = metadata.len() / 1024;
 
-    let reader = ImageReader::open(&path)
+    let reader = ImageReader::open(path)
         .map_err(|e| e.to_string())?
         .with_guessed_format()
         .map_err(|e| format!("Failed to read image headers: {}", e))?;
@@ -48,7 +48,7 @@ pub fn process_image(path: PathBuf) -> Result<ImageInfo, String> {
     let format = reader.format().ok_or("Unrecognized image format")?;
     let dimensions = reader.into_dimensions().map_err(|e| e.to_string())?;
 
-    let clean_path = path.to_string_lossy().to_string().replace("\\\\?\\", "");
+    let clean_path = path.to_string_lossy().replace("\\\\?\\", "");
 
     Ok(ImageInfo {
         path: clean_path,
@@ -56,7 +56,7 @@ pub fn process_image(path: PathBuf) -> Result<ImageInfo, String> {
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
-            .to_string(),
+            .into_owned(),
         format: format!("{:?}", format),
         width: dimensions.0,
         height: dimensions.1,
@@ -93,10 +93,10 @@ pub fn get_iqdb_payload(
         .unwrap_or(true);
 
     // 2. Identify if it needs conversion (IQDB natively accepts JPEG, PNG, GIF)
-    let needs_conversion = match info.format.to_lowercase().as_str() {
-        "webp" | "bmp" | "tiff" | "ico" | "tga" => true,
-        _ => false,
-    };
+    let needs_conversion = matches!(
+        info.format.to_lowercase().as_str(),
+        "webp" | "bmp" | "tiff" | "ico" | "tga"
+    );
 
     // 3. Identify if it breaks IQDB's hard 7500x7500 pixel limit
     let needs_resize = info.width > 7500 || info.height > 7500;
@@ -209,7 +209,7 @@ pub fn move_to_results(
     extension: &str,
     config: &AppConfig,
     payload: Option<&[u8]>,
-    default_base_dir: &Path
+    default_base_dir: &Path,
 ) -> Result<PathBuf, String> {
     // 1. Resolve base results directory (Default: ./results)
     let mut base_dir = PathBuf::from(&config.output_folder);
@@ -240,7 +240,7 @@ pub fn move_to_results(
             .file_stem()
             .unwrap_or_default()
             .to_string_lossy()
-            .to_string(),
+            .into_owned(),
         "random_id" => uuid::Uuid::new_v4().to_string(),
         _ => format!("{}{}", service_prefix, char_data.id),
     };
@@ -294,9 +294,9 @@ pub fn move_to_results(
         .copied()
         .unwrap_or(false);
 
-    if apply_mods && payload.is_some() {
+    if apply_mods && let Some(payload) = payload {
         // Write modified buffer directly to new destination & delete original
-        fs::write(&dest_path, payload.unwrap())
+        fs::write(&dest_path, payload)
             .map_err(|e| format!("Failed to write modified file: {}", e))?;
         let _ = fs::remove_file(source_path);
     } else {
@@ -307,18 +307,22 @@ pub fn move_to_results(
     Ok(dest_path)
 }
 
-pub fn move_to_invalid(source_path: &Path, config: &AppConfig, default_base_dir: &Path) -> Result<(), String> {
+pub fn move_to_invalid(
+    source_path: &Path,
+    config: &AppConfig,
+    default_base_dir: &Path,
+) -> Result<(), String> {
     let mut base_dir = PathBuf::from(&config.output_folder);
     if base_dir.as_os_str().is_empty() {
         base_dir = default_base_dir.to_path_buf();
     }
-    
+
     let folder_name = if config.invalid_folder.trim().is_empty() {
         ".invalid"
     } else {
         config.invalid_folder.trim()
     };
-    
+
     base_dir = base_dir.join(folder_name);
 
     fs::create_dir_all(&base_dir).map_err(|e| e.to_string())?;
@@ -331,12 +335,12 @@ pub fn move_to_invalid(source_path: &Path, config: &AppConfig, default_base_dir:
         .file_stem()
         .unwrap_or_default()
         .to_string_lossy()
-        .to_string();
+        .into_owned();
     let extension = dest_path
         .extension()
         .unwrap_or_default()
         .to_string_lossy()
-        .to_string();
+        .into_owned();
 
     // Ensure we don't accidentally overwrite an existing invalid file with the same name
     while dest_path.exists() {

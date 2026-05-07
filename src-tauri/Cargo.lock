@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "SauceBottle"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "apple-native-keyring-store",
  "dbus-secret-service-keyring-store",

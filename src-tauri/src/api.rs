@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use keyring_core::Entry;
@@ -38,7 +39,7 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
     }
     for (i, ca) in a.chars().enumerate() {
         for (j, cb) in b.chars().enumerate() {
-            let cost = if ca == cb { 0 } else { 1 };
+            let cost = usize::from(ca != cb);
             dp[i + 1][j + 1] = *[dp[i][j + 1] + 1, dp[i + 1][j] + 1, dp[i][j] + cost]
                 .iter()
                 .min()
@@ -68,25 +69,30 @@ fn process_blacklist_rules(tag: &str, blacklist: &[String], handle: &tauri::AppH
 
     for b in blacklist {
         if tag_lower.starts_with(&format!("{}_(", b)) {
-            let msg = format!("Your blacklisted tag '{}' partially matched '{}'. Did you mean to blacklist the latter?", b, tag);
+            let msg = format!(
+                "Your blacklisted tag '{}' partially matched '{}'. Did you mean to blacklist the latter?",
+                b, tag
+            );
             let _ = handle.emit("warn", msg.clone());
         }
 
-        let length_diff = (tag_lower.len() as isize - b.len() as isize).abs();
+        let length_diff = tag_lower.len().abs_diff(b.len());
 
         // Determine how many typos we tolerate based on the blacklist tag's length
-        let max_dist: i32 = match b.len() {
+        let max_dist: usize = match b.len() {
             0..=4 => 1,
             5..=9 => 2,
             _ => 3,
         };
 
-        // [TODO] as isize... as usize... as isize... as usize...
-        if length_diff <= max_dist as isize {
+        if length_diff <= max_dist {
             let dist = levenshtein_distance(&tag_lower, b);
 
-            if dist >= 1 && dist <= max_dist as usize {
-                let msg = format!("Your blacklisted tag '{}' is very similar to the found image tag '{}'. Did you mean to blacklist the latter?", b, tag);
+            if dist >= 1 && dist <= max_dist {
+                let msg = format!(
+                    "Your blacklisted tag '{}' is very similar to the found image tag '{}'. Did you mean to blacklist the latter?",
+                    b, tag
+                );
                 let _ = handle.emit("warn", msg.clone());
             }
         }
@@ -110,7 +116,7 @@ fn url_encode(input: &str) -> String {
                 encoded.push(byte as char);
             }
             _ => {
-                encoded.push_str(&format!("%{:02X}", byte));
+                let _ = write!(encoded, "%{:02X}", byte);
             }
         }
     }
@@ -158,12 +164,12 @@ fn clean_tag(tag: &str) -> String {
 // ---- API Interactions --------------*
 
 pub struct ApiClient {
-    config: Arc<Mutex<AppConfig>>,
+    config: Arc<Mutex<Arc<AppConfig>>>,
     client: reqwest::Client,
 }
 
 impl ApiClient {
-    pub fn new(config: Arc<Mutex<AppConfig>>) -> Self {
+    pub fn new(config: Arc<Mutex<Arc<AppConfig>>>) -> Self {
         Self {
             config,
             client: reqwest::Client::new(),
@@ -173,9 +179,9 @@ impl ApiClient {
     /// Retrieves a cloned reference to the active application configuration.
     ///
     /// # Returns
-    /// * `Arc<Mutex<AppConfig>>` - A thread-safe config object clone.
-    pub fn config(&self) -> Arc<Mutex<AppConfig>> {
-        self.config.clone()
+    /// * `Arc<AppConfig>` - A cloned reference to the config object.
+    pub fn config(&self) -> Arc<AppConfig> {
+        self.config.lock().unwrap().clone()
     }
 
     /// Checks the native OS credential manager to determine which services
@@ -192,21 +198,20 @@ impl ApiClient {
                 continue;
             }
 
-            if let Ok(entry) = keyring_core::Entry::new("saucebottle_vault", &srv.to_lowercase()) {
-                if let Ok(secret_string) = entry.get_password() {
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&secret_string) {
-                        let has_u = parsed["username"]
-                            .as_str()
-                            .map(|s| !s.trim().is_empty())
-                            .unwrap_or(false);
-                        let has_k = parsed["apiKey"]
-                            .as_str()
-                            .map(|s| !s.trim().is_empty())
-                            .unwrap_or(false);
-                        if has_u && has_k {
-                            active.push(srv.to_string());
-                        }
-                    }
+            if let Ok(entry) = keyring_core::Entry::new("saucebottle_vault", &srv.to_lowercase())
+                && let Ok(secret_string) = entry.get_password()
+                && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&secret_string)
+            {
+                let has_u = parsed["username"]
+                    .as_str()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                let has_k = parsed["apiKey"]
+                    .as_str()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                if has_u && has_k {
+                    active.push(srv.to_string());
                 }
             }
         }
@@ -251,7 +256,7 @@ impl ApiClient {
             .map_err(|e| e.to_string())?;
 
         let html_content = res.text().await.map_err(|e| e.to_string())?;
-        let threshold = self.config.lock().unwrap().confidence_threshold;
+        let threshold = self.config().confidence_threshold;
 
         let (service, id, similarity) =
             self.parse_iqdb_html(&html_content, active_services, threshold)?;
@@ -284,7 +289,7 @@ impl ApiClient {
         // [TODO] Reworking the if / else if / else if further at the bottom that handles each service individually (surely there must be a way to handle that better...)
         // [TODO] IQDB supports more services than just the current 3 *puts gun in mouth* (Traits???????)
 
-        let live_cfg = self.config.lock().unwrap().clone();
+        let live_cfg = self.config();
         let cfg = live_cfg
             .services
             .get(service)
@@ -300,22 +305,19 @@ impl ApiClient {
         let mut actual_username = String::new();
         let mut actual_api_key = String::new();
 
-        if let Ok(entry) = Entry::new("saucebottle_vault", &service.to_lowercase()) {
-            if let Ok(secret_string) = entry.get_password() {
-                if let Ok(parsed_secrets) =
-                    serde_json::from_str::<serde_json::Value>(&secret_string)
-                {
-                    if let Some(u) = parsed_secrets["username"].as_str() {
-                        if !u.trim().is_empty() {
-                            actual_username = u.to_string();
-                        }
-                    }
-                    if let Some(k) = parsed_secrets["apiKey"].as_str() {
-                        if !k.trim().is_empty() {
-                            actual_api_key = k.to_string();
-                        }
-                    }
-                }
+        if let Ok(entry) = Entry::new("saucebottle_vault", &service.to_lowercase())
+            && let Ok(secret_string) = entry.get_password()
+            && let Ok(parsed_secrets) = serde_json::from_str::<serde_json::Value>(&secret_string)
+        {
+            if let Some(u) = parsed_secrets["username"].as_str()
+                && !u.trim().is_empty()
+            {
+                actual_username = u.to_string();
+            }
+            if let Some(k) = parsed_secrets["apiKey"].as_str()
+                && !k.trim().is_empty()
+            {
+                actual_api_key = k.to_string();
             }
         }
 
@@ -407,41 +409,38 @@ impl ApiClient {
                     .header("User-Agent", &user_agent)
                     .send()
                     .await
+                    && let Ok(raw_text) = tag_res.text().await
+                    && let Ok(tag_json) = serde_json::from_str::<serde_json::Value>(&raw_text)
+                    && let Some(arr) = tag_json["tag"].as_array().or(tag_json.as_array())
                 {
-                    if let Ok(raw_text) = tag_res.text().await {
-                        if let Ok(tag_json) = serde_json::from_str::<serde_json::Value>(&raw_text) {
-                            if let Some(arr) = tag_json["tag"].as_array().or(tag_json.as_array()) {
-                                let filtered: Vec<_> = arr
-                                    .iter()
-                                    .filter(|t| {
-                                        let name = t["name"].as_str().unwrap_or("");
-                                        !process_blacklist_rules(name, &blacklist, handle)
-                                    })
-                                    .collect();
+                    let filtered: Vec<_> = arr
+                        .iter()
+                        .filter(|t| {
+                            let name = t["name"].as_str().unwrap_or("");
+                            !process_blacklist_rules(name, &blacklist, handle)
+                        })
+                        .collect();
 
-                                if let Some(c) = filtered
-                                    .iter()
-                                    .find(|t| t["type"] == 4)
-                                    .and_then(|t| t["name"].as_str())
-                                {
-                                    character = c.to_string();
-                                }
-                                if let Some(f) = filtered
-                                    .iter()
-                                    .find(|t| t["type"] == 3)
-                                    .and_then(|t| t["name"].as_str())
-                                {
-                                    fandom = f.to_string();
-                                }
-                                if let Some(a) = filtered
-                                    .iter()
-                                    .find(|t| t["type"] == 1)
-                                    .and_then(|t| t["name"].as_str())
-                                {
-                                    artist = a.to_string();
-                                }
-                            }
-                        }
+                    if let Some(c) = filtered
+                        .iter()
+                        .find(|t| t["type"] == 4)
+                        .and_then(|t| t["name"].as_str())
+                    {
+                        character = c.to_string();
+                    }
+                    if let Some(f) = filtered
+                        .iter()
+                        .find(|t| t["type"] == 3)
+                        .and_then(|t| t["name"].as_str())
+                    {
+                        fandom = f.to_string();
+                    }
+                    if let Some(a) = filtered
+                        .iter()
+                        .find(|t| t["type"] == 1)
+                        .and_then(|t| t["name"].as_str())
+                    {
+                        artist = a.to_string();
                     }
                 }
             }
@@ -468,33 +467,32 @@ impl ApiClient {
                 .header("User-Agent", &user_agent)
                 .send()
                 .await
+                && let Ok(html_text) = html_res.text().await
             {
-                if let Ok(html_text) = html_res.text().await {
-                    let document = Html::parse_document(&html_text);
+                let document = Html::parse_document(&html_text);
 
-                    // Helper to find the first non-blacklisted tag in a specific HTML category
-                    let extract_yandere = |tag_class: &str, default: &str| -> String {
-                        if let Ok(sel) = Selector::parse(&format!("li.{} a", tag_class)) {
-                            for a in document.select(&sel) {
-                                if let Some(href) = a.value().attr("href") {
-                                    if href.starts_with("/post?tags=") {
-                                        let tag_name = a.text().collect::<String>();
+                // Helper to find the first non-blacklisted tag in a specific HTML category
+                let extract_yandere = |tag_class: &str, default: &str| -> String {
+                    if let Ok(sel) = Selector::parse(&format!("li.{} a", tag_class)) {
+                        for a in document.select(&sel) {
+                            if let Some(href) = a.value().attr("href")
+                                && href.starts_with("/post?tags=")
+                            {
+                                let tag_name = a.text().collect::<String>();
 
-                                        if process_blacklist_rules(&tag_name, &blacklist, handle) {
-                                            continue;
-                                        }
-                                        return tag_name;
-                                    }
+                                if process_blacklist_rules(&tag_name, &blacklist, handle) {
+                                    continue;
                                 }
+                                return tag_name;
                             }
                         }
-                        default.to_string()
-                    };
+                    }
+                    default.to_string()
+                };
 
-                    character = extract_yandere("tag-type-character", "Original");
-                    fandom = extract_yandere("tag-type-copyright", "Unknown");
-                    artist = extract_yandere("tag-type-artist", "Unknown");
-                }
+                character = extract_yandere("tag-type-character", "Original");
+                fandom = extract_yandere("tag-type-copyright", "Unknown");
+                artist = extract_yandere("tag-type-artist", "Unknown");
             }
         }
 
@@ -558,16 +556,12 @@ impl ApiClient {
                     }
 
                     for a_tag in table.select(&a_sel) {
-                        if let Some(href) = a_tag.value().attr("href") {
-                            if let Ok((srv, id)) = self.extract_service_and_id(href) {
-                                if valid_lower.contains(&srv.to_lowercase()) {
-                                    if best_match.is_none()
-                                        || similarity > best_match.as_ref().unwrap().2
-                                    {
-                                        best_match = Some((srv.clone(), id, similarity));
-                                    }
-                                }
-                            }
+                        if let Some(href) = a_tag.value().attr("href")
+                            && let Ok((srv, id)) = self.extract_service_and_id(href)
+                            && valid_lower.contains(&srv.to_lowercase())
+                            && best_match.as_ref().is_none_or(|t| similarity > t.2)
+                        {
+                            best_match = Some((srv, id, similarity));
                         }
                     }
                 }

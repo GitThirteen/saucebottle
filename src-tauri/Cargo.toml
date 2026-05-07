@@ -1,9 +1,9 @@
 [package]
 name = "SauceBottle"
-version = "1.0.3"
+version = "1.0.4"
 description = "A saucy background daemon for automating your anime artwork collection."
 authors = ["Thirteen"]
-edition = "2021"
+edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
