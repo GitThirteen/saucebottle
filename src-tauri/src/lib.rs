@@ -567,6 +567,7 @@ pub fn run() {
     let api_client = Arc::new(ApiClient::new(live_config.clone()));
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())

@@ -312,7 +312,14 @@ pub fn move_to_invalid(source_path: &Path, config: &AppConfig, default_base_dir:
     if base_dir.as_os_str().is_empty() {
         base_dir = default_base_dir.to_path_buf();
     }
-    base_dir = base_dir.join(&config.invalid_folder);
+    
+    let folder_name = if config.invalid_folder.trim().is_empty() {
+        ".invalid"
+    } else {
+        config.invalid_folder.trim()
+    };
+    
+    base_dir = base_dir.join(folder_name);
 
     fs::create_dir_all(&base_dir).map_err(|e| e.to_string())?;
 

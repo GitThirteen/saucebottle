@@ -24,9 +24,9 @@
     "security": {
       "assetProtocol": {
         "enable": true,
-        "scope": ["**"]
+        "scope": ["$PICTURE/**", "$APPDATA/**"]
       },
-      "csp": "default-src 'self'; script-src 'self'; connect-src 'none'; img-src 'self' asset: tauri:"
+      "csp": "default-src 'self'; script-src 'self'; connect-src 'none'; img-src 'self' asset: tauri: http://asset.localhost https://asset.localhost"
     }
   },
   "bundle": {
