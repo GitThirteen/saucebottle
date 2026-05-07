@@ -141,7 +141,7 @@ watch(
   [
     isPermanentScan, autoUpdateEnabled, flags, activeHierarchy, availableBlocks, renameBehavior, 
     duplicateBehavior, confidenceThreshold, outputFolder, originalFolder, 
-    invalidFolder, downloadsFolder, blacklist
+    invalidFolder, downloadsFolder, blacklist, autostart
   ], 
   async () => {
     // Prevent saving default states before the actual config is loaded
@@ -156,7 +156,8 @@ watch(
     const payloadFlags = {
       ...flags.value,
       isPermanentScan: isPermanentScan.value,
-      autoUpdateEnabled: autoUpdateEnabled.value
+      autoUpdateEnabled: autoUpdateEnabled.value,
+      runOnBoot: autostart.value
     };
 
     const payload = {
