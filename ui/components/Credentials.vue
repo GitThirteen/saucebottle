@@ -129,7 +129,7 @@ const openSite = async (url: string) => {
       </div>
       
       <div v-if="vaultStatus.danbooru && !isEditing.danbooru" class="locked-state">
-         <div class="locked-info"><CheckCircle2Icon :size="20"/> Saved securely in OS Vault</div>
+         <div class="locked-info"><CheckCircle2Icon :size="20"/> Saved</div>
          <div class="locked-actions">
             <button class="change-btn" @click="openEdit('danbooru')"><Edit2Icon :size="16"/> Change</button>
             <button class="trash-btn" @click="deleteSecurely('danbooru')" title="Delete Credentials"><Trash2Icon :size="18"/></button>
@@ -161,7 +161,7 @@ const openSite = async (url: string) => {
       </div>
       
       <div v-if="vaultStatus.gelbooru && !isEditing.gelbooru" class="locked-state">
-         <div class="locked-info"><CheckCircle2Icon :size="20"/> Saved securely in OS Vault</div>
+         <div class="locked-info"><CheckCircle2Icon :size="20"/> Saved</div>
          <div class="locked-actions">
             <button class="change-btn" @click="openEdit('gelbooru')"><Edit2Icon :size="16"/> Change</button>
             <button class="trash-btn" @click="deleteSecurely('gelbooru')" title="Delete Credentials"><Trash2Icon :size="18"/></button>

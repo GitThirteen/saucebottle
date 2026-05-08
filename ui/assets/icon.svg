@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Inkscape (http://www.inkscape.org/) -->
+
+<svg
+   width="52.448166mm"
+   height="52.44817mm"
+   viewBox="0 0 52.448166 52.44817"
+   version="1.1"
+   id="svg1"
+   xml:space="preserve"
+   xmlns:xlink="http://www.w3.org/1999/xlink"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg"><defs
+     id="defs1"><linearGradient
+       id="linearGradient10"><stop
+         style="stop-color:#ff416c;stop-opacity:1;"
+         offset="0"
+         id="stop10" /><stop
+         style="stop-color:#ff4b2b;stop-opacity:1;"
+         offset="1"
+         id="stop11" /></linearGradient><linearGradient
+       xlink:href="#linearGradient10"
+       id="linearGradient11"
+       x1="9.7795429"
+       y1="22.242134"
+       x2="18.306604"
+       y2="3.9557929"
+       gradientUnits="userSpaceOnUse" /></defs><g
+     id="layer1"
+     transform="translate(-25.976102,-25.12356)"><rect
+       style="display:none;opacity:1;fill:#202020;fill-opacity:1;stroke-width:0.247789"
+       id="rect1"
+       width="52.44817"
+       height="52.44817"
+       x="25.976101"
+       y="25.12356" /><g
+       style="fill:none;fill-opacity:1;stroke:#000000;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;stroke-opacity:1"
+       id="g2"
+       transform="matrix(1.7337631,0,0,1.7337631,30.424123,28.582832)"><g
+         id="g13"><ellipse
+           style="fill:#52dee5;fill-opacity:1;stroke:none;stroke-width:0.218273;stroke-linecap:round;stroke-linejoin:round;stroke-dasharray:none;stroke-opacity:1"
+           id="path3"
+           cx="8.5911217"
+           cy="13.34971"
+           rx="4.6364169"
+           ry="4.5641389" /><path
+           d="m 10.040298,5.2648835 c 1.1978,-1.2280444 2.144049,-3.1518218 2.519702,-4.95280596 0.709583,3.54791566 2.838333,5.54230606 5.676665,7.81297166 2.838333,2.2706668 4.257499,4.9670828 4.257499,7.8054148 0.03654,8.839419 -10.644786,13.2967 -16.9022687,7.053257"
+           id="path2"
+           style="fill:none;fill-opacity:1;stroke:url(#linearGradient11);stroke-width:3.27438;stroke-dasharray:none;stroke-opacity:1" /></g></g></g></svg>
