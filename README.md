@@ -22,7 +22,7 @@
 
 ## Introduction
 
-Born from being tired of having to sort downloaded artwork manually, _SauceBottle_ is a lightweight background daemon taking care of the tedious manual work. By monitoring a specified `input` folder, _SauceBottle_ automatically identifies artwork via reverse-image search using IQDB, and organizes your collection into a clean, customizable directory structure.
+Born from being tired of having to manually sort downloaded artwork, _SauceBottle_ is a lightweight background daemon taking care of the tedious manual work. By monitoring a specified `input` folder, _SauceBottle_ automatically identifies artwork via reverse-image search using IQDB, and organizes your collection into a clean, customizable directory structure.
 
 ## How do I use this?
 
@@ -67,7 +67,7 @@ If you want to use the batch downloader, navigate to the `Downloader` tab, enter
 
 #### Daemonization
 
-The daemon will continue running when closed. You can always close it by right-clicking it in your system's tray. As long as it is running (and automatic sweeping is enabled), it will continue to watch your `input` folder in the background with effectively 0 CPU impact.
+The daemon will continue running when closed. You can always fully exit it by right-clicking it in your system's tray. As long as it is running (and automatic sweeping is enabled), it will continue to watch your `input` folder in the background with effectively 0 CPU impact.
 
 
 ## How do I build this?
@@ -134,7 +134,7 @@ As Vite can obscure certain issues (especially in regard to Tauri permissions), 
 
 As this is a project I can only work on in my free time, **any** contribution is massively appreciated!
 
-To contribute, please at first take a look at the **[SauceBottle To-Do board](https://github.com/users/GitThirteen/projects/1)** and / or the [project issues](https://github.com/GitThirteen/saucebottle/issues) (they should be synchronized) to check the status of current tasks, bugfixes, and improvements. If you have a feature suggestion or noticed a bug that has not been tracked yet, **please create an issue for it**.
+To contribute, at first please take a look at the **[SauceBottle To-Do board](https://github.com/users/GitThirteen/projects/1)** and/or the [project issues](https://github.com/GitThirteen/saucebottle/issues) (they should be synchronized) to check the status of current tasks, bugfixes, and improvements. If you have a feature suggestion or noticed a bug that has not been tracked yet, **please create an issue for it**.
 
 If you want to contribute but have no starting point, you are free to pick up any task marked as `📝 To Do` on the board. Please let us know in the respective issue that you have started working on it or if you require any additional information.
 
@@ -142,7 +142,7 @@ If you want to contribute but have no starting point, you are free to pick up an
 
 - **Code Formatting:** Please ensure your code is formatted before submitting a PR.
   - **For Rust ("backend"):** Run `cargo fmt` and `cargo clippy`.
-  - **For Frontend:** Run `npm run lint` (or your preferred formatter).
+  - **For Vue ("frontend"):** Run `npm run lint` (or your preferred formatter).
 - **Commit History:** It is totally fine to have multiple commits! Your PRs will be squashed before merging.
 - **Versioning:** Do ***not*** bump versions yourself. Unless your PR fixes a critical bug, this will happen automatically when enough features have been accumulated or enough time has passed to warrant a new release.
 - **Link Your Issues:** When submitting a Pull Request, please include `Closes #issue_number` (or similar) in the description.
