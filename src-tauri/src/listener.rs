@@ -34,6 +34,41 @@ use crate::processor;
 // Certain println! should either be logged to the frontend or deleted, but right now some messages do get logged while others are internal-only.
 // This is messy and needs a thorough clean-up.
 
+/// Asynchronously waits for a file to finish writing to disk by polling for exclusive write access.
+/// Uses an exponential backoff strategy, starting at 10ms for small files, increasing the interval
+/// by x1.5 to prevent CPU pegging on larger files or slow drives.
+/// 
+/// # Arguments
+/// * `path` - The file path of the file we want to read.
+async fn wait_for_file_ready(path: &PathBuf) -> Result<(), &'static str> {
+    let start_time = std::time::Instant::now();
+
+    let mut current_delay = Duration::from_millis(10);
+    let max_delay = Duration::from_millis(150);
+    let timeout = Duration::from_secs(10);
+
+    loop {
+        match std::fs::OpenOptions::new().append(true).open(path) {
+            Ok(_) => {
+                return Ok(());
+            }
+            Err(_) => {
+                if start_time.elapsed() > timeout {
+                    return Err("Timed out waiting for file to finish writing to disk.");
+                }
+
+                tokio::time::sleep(current_delay).await;
+
+                // Increase the delay by x1.5 for the next loop, capping at max_delay
+                current_delay = std::cmp::min(
+                current_delay.mul_f32(1.5), 
+                max_delay
+                );
+            }
+        }
+    }
+}
+
 /// Handles the end-to-end processing lifecycle of a single image file.
 /// This includes file validation, querying IQDB, formatting data, moving the file
 /// to the appropriate results/invalid folder, and emitting state updates to the UI.
@@ -52,11 +87,13 @@ async fn process_single_file(
     is_new_drop: bool,
     queued_tracker: Arc<Mutex<HashSet<PathBuf>>>,
 ) {
-    // [WARN] Currently, if the file was just dropped, we wait 500ms so the OS finishes the disk write before we attempt to open and read its bytes.
-    // I don't think I need to thoroughly explain why this idea is stupid (but hey, it works -- for now).
-    // [TODO] Fix this, currently any drop that takes longer than half a second is pretty much guaranteed to auto-fail
     if is_new_drop {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Err(e) = wait_for_file_ready(&path).await {
+            queued_tracker.lock().unwrap().remove(&path);
+            let _ = handle.emit("failure", format!("File read error on {:?}: {}", path.file_name().unwrap_or_default(), e));
+            let _ = handle.emit("task-done", ());
+            return;
+        }
     }
 
     let active_services = client.get_active_credentials();
