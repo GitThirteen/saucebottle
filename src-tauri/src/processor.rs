@@ -28,7 +28,8 @@ use crate::models::{AppConfig, BooruResponse, ImageInfo};
 // ---- PROCESSOR.RS ---------------*
 // ---------------------------------*
 
-const MAX_FILE_SIZE: u64 = 8 * 1024 * 1024; // 8MB IQDB limit
+// 8MB IQDB limit
+const MAX_FILE_SIZE: u64 = 8 * 1024 * 1024;
 
 /// Strips illegal characters from a string so it can be safely used as a folder or file name.
 ///
@@ -44,6 +45,23 @@ fn sanitize_filename(name: &str) -> String {
         .to_string()
 }
 
+fn finalize_path(target_dir: &Path, file_stem: &str, extension: &str) -> PathBuf {
+    // Build the base path
+    let mut dest_path = target_dir.join(file_stem);
+    dest_path.add_extension(extension);
+    
+    // Handle collisions
+    let mut counter = 0;
+    while dest_path.exists() {
+        counter += 1;
+        
+        dest_path = target_dir.join(format!("{}_copy{}", file_stem, counter));
+        dest_path.add_extension(extension);
+    }
+
+    dest_path
+}
+ 
 /// Opens an image file to quickly read its metadata headers without decoding the entire
 /// pixel grid into memory. This extracts the exact dimensions, format, and file size.
 ///
@@ -261,8 +279,8 @@ pub fn move_to_results(
         _ => format!("{}{}", service_prefix, char_data.id),
     };
 
+    // 4. Handle duplicate entries
     let mut dest_path = base_dir.join(format!("{}.{}", final_filename, extension));
-
     if dest_path.exists() {
         let list_dupes = config.flags.get("listDupes").copied().unwrap_or(true);
         if list_dupes {
@@ -272,16 +290,16 @@ pub fn move_to_results(
             );
         }
 
+        let mut target_dir = base_dir.clone();
+
         match config.duplicate_behavior.as_str() {
             "delete" => {
                 let _ = fs::remove_file(source_path);
                 return Ok(dest_path);
             }
             "move_folder_deep" => {
-                let dup_dir = base_dir.join(".duplicates");
-
-                fs::create_dir_all(&dup_dir).map_err(|e| e.to_string())?;
-                dest_path = dup_dir.join(format!("{}.{}", final_filename, extension));
+                target_dir = base_dir.join(".duplicates");
+                fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
             }
             "move_folder_root" => {
                 let mut dup_root = PathBuf::from(&config.output_folder);
@@ -289,19 +307,13 @@ pub fn move_to_results(
                     dup_root = default_base_dir.to_path_buf();
                 }
 
-                let dup_dir = dup_root.join(".duplicates");
-                fs::create_dir_all(&dup_dir).map_err(|e| e.to_string())?;
-                dest_path = dup_dir.join(format!("{}.{}", final_filename, extension));
+                target_dir = dup_root.join(".duplicates");
+                fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
             }
-            _ => {
-                let mut counter = 0;
-                while dest_path.exists() {
-                    counter += 1;
-                    dest_path =
-                        base_dir.join(format!("{}_copy{}.{}", final_filename, counter, extension));
-                }
-            }
+            _ => {}
         }
+
+        dest_path = finalize_path(&target_dir, &final_filename, extension);
     }
 
     let apply_mods = config
@@ -340,29 +352,11 @@ pub fn move_to_invalid(
     };
 
     base_dir = base_dir.join(folder_name);
-
     fs::create_dir_all(&base_dir).map_err(|e| e.to_string())?;
 
-    let filename = source_path.file_name().unwrap_or_default();
-    let mut dest_path = base_dir.join(filename);
-
-    let mut counter = 0;
-    let file_stem = dest_path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
-    let extension = dest_path
-        .extension()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
-
-    // Ensure we don't accidentally overwrite an existing invalid file with the same name
-    while dest_path.exists() {
-        counter += 1;
-        dest_path = base_dir.join(format!("{}_copy{}.{}", file_stem, counter, extension));
-    }
-
+    let file_stem = source_path.file_stem().unwrap_or_default().to_string_lossy();
+    let extension = source_path.extension().unwrap_or_default().to_string_lossy();
+    
+    let dest_path = finalize_path(&base_dir, &file_stem, &extension);
     atomic_move(source_path, &dest_path)
 }
