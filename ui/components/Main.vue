@@ -169,8 +169,8 @@ const handleImageError = () => {
           </div>
 
           <div v-else-if="appState === 'result'" class="info-panel">
-            <p class="identified-text" v-if="resultData.name === 'Original' && (resultData.fandom === 'Original' || resultData.fandom === 'Unknown')">
-              Identified as <span class="highlight">Original</span><br>
+            <p class="identified-text" v-if="resultData.name === 'Original'">
+              Identified as <span class="highlight">Original Artwork</span><br>
               made by <span class="fandom">{{ resultData.artist !== 'Unknown' ? resultData.artist : 'Anon' }}</span>
             </p>
             <p class="identified-text" v-else>

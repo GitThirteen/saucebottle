@@ -519,10 +519,20 @@ impl ApiClient {
         }
         .to_string();
 
+        let mut fandom = clean_tag(&fandom);
+        if fandom == "Unknown" || fandom == "Original" {
+            let fallback = live_cfg.original_folder.trim();
+            fandom = if fallback.is_empty() {
+                "Original".to_string()
+            } else {
+                fallback.to_string()
+            };
+        }
+
         Ok(BooruResponse {
             id: id.to_string(),
             name: clean_tag(&character),
-            fandom: clean_tag(&fandom),
+            fandom: fandom,
             artist: clean_tag(&artist),
             rating,
             year,

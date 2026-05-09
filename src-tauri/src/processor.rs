@@ -45,6 +45,15 @@ fn sanitize_filename(name: &str) -> String {
         .to_string()
 }
 
+/// Simple helper for assembling the final file location, including correct duplication handling.
+/// 
+/// # Arguments
+/// * `target_dir` - The location where the final file should go.
+/// * `file_stem` - The name of the identified artwork.
+/// * `extension` - The artwork's file extension.
+/// 
+/// # Returns
+/// * `PathBuf` - The cleaned directory path describing where the file should go.
 fn finalize_path(target_dir: &Path, file_stem: &str, extension: &str) -> PathBuf {
     // Build the base path
     let mut dest_path = target_dir.join(file_stem);
