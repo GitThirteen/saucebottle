@@ -263,19 +263,31 @@ impl ApiClient {
             form = form.text("service[]", id.to_string());
         }
 
-        // [TODO] Verify if header is cool
+        let app_version = env!("CARGO_PKG_VERSION");
+        let saucebottle_agent = format!(
+            "SauceBottle/{} (https://github.com/GitThirteen/SauceBottle)", 
+            app_version
+        );
+
         let res = self.client.post("https://www.iqdb.org/")
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+            .header("User-Agent", saucebottle_agent)
             .multipart(form)
             .send()
             .await
             .map_err(|e| e.to_string())?;
 
+        if !res.status().is_success() {
+            if res.status().as_u16() == 429 {
+                return Err("IQDB Rate Limit Exceeded. Please pause and try again later.".to_string());
+            }
+            return Err(format!("IQDB Server Error: HTTP {}", res.status()));
+        }
+
         let html_content = res.text().await.map_err(|e| e.to_string())?;
         let threshold = self.config().confidence_threshold;
 
         let (service, id, similarity) =
-            self.parse_iqdb_html(&html_content, active_services, threshold)?;
+            self.parse_iqdb_html(&html_content, active_services, threshold, handle)?;
         self.fetch_booru_details(&service, &id, similarity, handle)
             .await
     }
@@ -348,7 +360,7 @@ impl ApiClient {
             .replace("${API_KEY}", &actual_api_key);
 
         let user_agent = if actual_username.is_empty() {
-            "SauceBottle/1.0".to_string()
+            format!("SauceBottle/{} (https://github.com/GitThirteen/SauceBottle)", env!("CARGO_PKG_VERSION"))
         } else {
             format!("Booru user {}", actual_username)
         };
@@ -548,6 +560,7 @@ impl ApiClient {
     /// * `html` - The raw HTML response string from IQDB.
     /// * `valid_services` - A list of services the user has configured/allowed.
     /// * `threshold` - The minimum similarity percentage required to constitute a valid match.
+    /// * `handle` - The Tauri AppHandle for relaying warnings.
     ///
     /// # Returns
     /// * `Result<(String, String, u8), String>` - A tuple containing `(Service Name, Post ID, Similarity)` if a successful match is found,
@@ -557,6 +570,7 @@ impl ApiClient {
         html: &str,
         valid_services: &[String],
         threshold: u8,
+        handle: &tauri::AppHandle,
     ) -> Result<(String, String, u8), String> {
         let document = Html::parse_document(html);
         let table_sel = Selector::parse("table").unwrap();
@@ -564,37 +578,80 @@ impl ApiClient {
         let a_sel = Selector::parse("a").unwrap();
 
         let mut best_match: Option<(String, String, u8)> = None;
+        let mut best_unconfigured_match: Option<(String, u8)> = None;
+        let mut highest_similarity = 0;
+
         let valid_lower: Vec<String> = valid_services.iter().map(|s| s.to_lowercase()).collect();
 
         for table in document.select(&table_sel) {
-            if let Some(th) = table.select(&th_sel).next() {
-                let header_text = th.text().collect::<Vec<_>>().join(" ").to_lowercase();
+            let Some(th) = table.select(&th_sel).next() else { // Skip if there is no table header
+                continue; 
+            };
 
-                if header_text.contains("match") {
-                    let table_text = table.text().collect::<Vec<_>>().join(" ");
-                    let similarity = SIMILARITY_REGEX
-                        .captures(&table_text)
-                        .and_then(|cap| cap[1].parse::<u8>().ok())
-                        .unwrap_or(0);
+            let header_text = th.text().collect::<Vec<_>>().join(" ").to_lowercase();
 
-                    if similarity < threshold {
-                        continue;
+            if !header_text.contains("match") { // Skip if the header doesn't indicate a match
+                continue;
+            }
+
+            let table_text = table.text().collect::<Vec<_>>().join(" ");
+            let similarity = SIMILARITY_REGEX
+                .captures(&table_text)
+                .and_then(|cap| cap[1].parse::<u8>().ok())
+                .unwrap_or(0);
+
+            if similarity > highest_similarity {
+                highest_similarity = similarity;
+            }
+
+            if similarity < threshold { // Skip if it doesn't meet the user's threshold
+                continue;
+            }
+
+            for a_tag in table.select(&a_sel) {
+                let Some(href) = a_tag.value().attr("href") else { 
+                    continue; 
+                };
+
+                match self.extract_service_and_id(href) {
+                    Ok((srv, id)) => {
+                        if valid_lower.contains(&srv.to_lowercase()) {
+                            if best_match.as_ref().is_none_or(|t| similarity > t.2) {
+                                best_match = Some((srv, id, similarity));
+                            }
+                        } else {
+                            // It's a supported service (like Danbooru) but the user hasn't added API keys
+                            if best_unconfigured_match.as_ref().is_none_or(|t| similarity > t.1) {
+                                best_unconfigured_match = Some((srv, similarity));
+                            }
+                        }
                     }
+                    Err(parse_error) => {
+                        let href_lower = href.to_lowercase();
+                        
+                        // Only warn if it's a SauceBottle-supported service that we failed to parse.
+                        let is_supported = href_lower.contains("danbooru") 
+                            || href_lower.contains("gelbooru") 
+                            || href_lower.contains("yande.re");
 
-                    for a_tag in table.select(&a_sel) {
-                        if let Some(href) = a_tag.value().attr("href")
-                            && let Ok((srv, id)) = self.extract_service_and_id(href)
-                            && valid_lower.contains(&srv.to_lowercase())
-                            && best_match.as_ref().is_none_or(|t| similarity > t.2)
-                        {
-                            best_match = Some((srv, id, similarity));
+                        if is_supported {
+                            let msg = format!("IQDB returned a link, but SauceBottle failed to parse it: {}", parse_error);
+                            let _ = handle.emit("warn", msg);
                         }
                     }
                 }
             }
         }
 
-        best_match.ok_or_else(|| "No match found on IQDB that meets the confidence threshold for your configured services.".to_string())
+        if let Some(m) = best_match {
+            Ok(m)
+        } else if let Some((srv, sim)) = best_unconfigured_match {
+            Err(format!("Found a {}% match on {}, but you do not have credentials configured for it.", sim, srv))
+        } else if highest_similarity > 0 {
+            Err(format!("Highest match found was {}%, which is below your {}% threshold.", highest_similarity, threshold))
+        } else {
+            Err("IQDB returned no matches for this image.".to_string())
+        }
     }
 
     /// Helper method to extract the destination Booru service and specific image ID from an IQDB result's hyperlink (`href`).
