@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="ui/assets/icon.svg" alt="S" width="12%" align="middle" /><img src="ui/assets/title.svg" alt="AUCEBOTTLE" width="50%" align="middle" />
+  <img src="ui/assets/visual/icon.svg" alt="S" width="12%" align="middle" /><img src="ui/assets/visual/title.svg" alt="AUCEBOTTLE" width="50%" align="middle" />
 </p>
 
 <div align="center">
