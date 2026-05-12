@@ -45,6 +45,7 @@ jobs:
         run: |
           echo "notes<<EOF" >> $GITHUB_OUTPUT
           cat PATCH_NOTES.md >> $GITHUB_OUTPUT
+          echo "" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Build and Release SauceBottle
