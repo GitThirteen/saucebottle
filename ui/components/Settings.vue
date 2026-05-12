@@ -31,7 +31,7 @@ import { open, ask } from '@tauri-apps/plugin-dialog';
 import { enable, disable, isEnabled } from '@tauri-apps/plugin-autostart';
 import { openUrl } from '@tauri-apps/plugin-opener';
 
-import { isPermanentScan, confidenceThreshold, autoUpdateEnabled } from '../store';
+import { isPermanentScan, confidenceThreshold, autoUpdateEnabled, isProcessing } from '../store';
 
 // ---------------------------------*
 // ---- META & INTERNAL STATE ------*
@@ -166,12 +166,6 @@ watch(
     // Prevent saving default states before the actual config is loaded
     if (!isDataLoaded.value) return;
 
-    try {
-      await invoke('set_scan_state', { active: isPermanentScan.value });
-    } catch (e) {
-      console.error("Failed to sync state with Rust:", e);
-    }
-
     const payloadFlags = {
       ...flags.value,
       isPermanentScan: isPermanentScan.value,
@@ -205,6 +199,8 @@ watch(
  * Syncs the frontend Autostart checkbox with the actual Host OS startup registry.
  */
 watch(autostart, async (newVal) => {
+  if (!isDataLoaded.value) return;
+
   try {
     if (newVal) await enable();
     else await disable();
@@ -332,10 +328,10 @@ const handleApplyModsChange = async (e: Event) => {
         </div>
       </label>
       <label class="checkbox-label">
-        <input type="checkbox" v-model="isPermanentScan" /> Listen to input directory automatically
+        <input type="checkbox" v-model="isPermanentScan" /> Process input directory automatically
         <div class="info-wrapper">
           <InfoIcon :size="14" class="info-icon" />
-          <span class="tooltip edge-right">Continuously monitor the /input folder for new drops without needing to click Run.</span>
+          <span class="tooltip edge-right">Continuously process the /input folder for new drops without needing to click the ▶︎ button.</span>
         </div>
       </label>
       <label class="checkbox-label">

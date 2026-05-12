@@ -80,22 +80,15 @@ const badgeClass = computed(() => {
   return 'badge-green';
 });
 
-watch(() => appState.value, (newState) => {
+watch(appState, (newState) => {
+  clearInterval(tipInterval);
+
   if (newState === 'updating') {
-    let currentIndex = tips.indexOf(currentTip.value);
-
     tipInterval = window.setInterval(() => {
-      let newIndex;
-      
-      do {
-        newIndex = Math.floor(Math.random() * tips.length);
-      } while (newIndex === currentIndex && tips.length > 1);
-
-      currentIndex = newIndex;
-      currentTip.value = tips[currentIndex];
+      let currentIndex = tips.indexOf(currentTip.value);
+      let newIndex = Math.floor(Math.random() * (tips.length - 1));
+      currentTip.value = tips.filter((_, i) => { return currentIndex !== i; })[newIndex];
     }, 6000);
-  } else {
-    clearInterval(tipInterval);
   }
 
   clearTimeout(slowNetworkTimer);
@@ -104,11 +97,11 @@ watch(() => appState.value, (newState) => {
   if (newState === 'processing') {
     slowNetworkTimer = window.setTimeout(() => {
       isSlowNetwork.value = true;
-    }, 12000);
+    }, 15000);
   }
 });
 
-watch(() => activeImage.value, () => {
+watch(activeImage, () => {
   isImageMovedTooFast.value = false;
 });
 
@@ -157,7 +150,7 @@ const openDestinationFolder = async () => {
   try {
     const absolutePath = await getAbsoluteDestinationPath();
     const folderPath = await dirname(absolutePath);
-    
+
     await invoke('open_system_folder', { folderTarget: folderPath });
   } catch (err) {
     console.error("Failed to open destination folder:", err);

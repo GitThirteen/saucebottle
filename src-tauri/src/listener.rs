@@ -307,10 +307,19 @@ pub fn spawn_watcher(
         let rt = tokio::runtime::Runtime::new().unwrap();
         for (path, is_new_drop) in proc_rx {
             if !processor_scanning.load(Ordering::Relaxed) {
-                worker_tracker.lock().unwrap().remove(&path);
-                let _ = processor_handle.emit("task-done", ());
-                continue;
+                let is_permanent = api_client.config().flags.get("isPermanentScan").copied().unwrap_or(true);
+
+                if is_permanent {
+                    while !processor_scanning.load(Ordering::Relaxed) {
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                    }
+                } else {
+                    worker_tracker.lock().unwrap().remove(&path);
+                    let _ = processor_handle.emit("task-done", ());
+                    continue;
+                }
             }
+            
             rt.block_on(async {
                 process_single_file(
                     path,
@@ -344,32 +353,36 @@ pub fn spawn_watcher(
             .expect("Watch failed");
 
         for res in rx {
-            if let Ok(event) = res
-                && event.kind.is_create()
-            {
-                for path in event.paths {
-                    if path.is_file() {
-                        if !is_scanning.load(Ordering::Relaxed) {
-                            continue;
-                        }
+            let Ok(event) = res else { continue }; // Skip if invalid event
+            
+            if !event.kind.is_create() { // Skip if not a file creation event
+                continue;
+            }
 
-                        // Prevent double queuing on drops as well
-                        if observer_tracker.lock().unwrap().insert(path.clone()) {
-                            println!("Queued new drop: {:?}", path);
-                            let _ = handle.emit("queue-add", ());
-                            let _ = watch_tx_clone.send((path, true));
-                        }
-                    }
+            for path in event.paths {
+                if !path.is_file() { // Skip if not a file
+                    continue;
                 }
+
+                if !is_scanning.load(Ordering::Relaxed) { // Skip if scanning is turned off
+                    continue;
+                }
+
+                if !observer_tracker.lock().unwrap().insert(path.clone()) { // Skip if already being tracked
+                    continue;
+                }
+
+                println!("Detected new drop: {:?}", path);
+                let _ = handle.emit("queue-add", ());
+                let _ = watch_tx_clone.send((path, true));
             }
         }
     });
 
     // [TODO] We might need more threads here.
     // E.g.:
-    // - A heartbeat thread that just periodically sweeps every 10-15 minutes to catch any files we for whatever reason missed (though I guess fixing the underlying causes would be more ideal...)
     // - A separate thread for the batch DL tab so the backend handles this gracefully. Right now, the frontend actually handles that asynchronously, and in the >>> worst case <<< this could result in an IP ban.
-    // - A staging thread that attempts to acquire a read-lock on files that are copied to the input folder before releasing it and sending it to the processor thread
+    // - Others?
 
     (proc_tx, queued_tracker)
 }

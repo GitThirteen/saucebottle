@@ -95,11 +95,6 @@ let isInitialized = false;
 /** Returns true if at least one Booru service has valid credentials. */
 export const hasCredentials = computed(() => vaultStatus.value.danbooru || vaultStatus.value.gelbooru);
 
-/** Keeps the internal `isProcessing` flag in sync with the user's permanent scan toggle. */
-watch(isPermanentScan, (val) => {
-    isProcessing.value = val;
-});
-
 // ---------------------------------*
 // ---- UTILITIES ------------------*
 // ---------------------------------*

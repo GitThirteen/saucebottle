@@ -1,6 +1,6 @@
 [package]
 name = "SauceBottle"
-version = "1.1.0"
+version = "1.1.1"
 description = "A saucy background daemon for automating your anime artwork collection."
 authors = ["Thirteen"]
 edition = "2024"

@@ -17,13 +17,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 -->
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue';
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue';
 import { 
   HomeIcon, 
   SettingsIcon, 
   TerminalIcon, 
   PlayIcon, 
   PauseIcon, 
+  SquareIcon,
   KeyIcon, 
   DownloadIcon, 
   UploadCloudIcon, 
@@ -51,7 +52,9 @@ import {
   syncOfflineQueue,
   appState,
   updateProgress,
-  updateStatus
+  updateStatus,
+  queueCount,
+  offlineQueueCount
 } from './store';
 import { unreadCount, setLogTabOpen } from './logger';
 import './assets/main.css';
@@ -62,6 +65,8 @@ import './assets/main.css';
 
 const currentTab = ref('main');
 const isDragging = ref(false);
+let terminateTimeout: number | undefined;
+let unlistenDragDrop: (() => void) | undefined;
 
 // ---------------------------------*
 // ---- COMPUTED -------------------*
@@ -99,18 +104,11 @@ const setTab = (tab: string) => {
 
 /**
  * Toggles the background scanning daemon on and off.
- * Syncs the new state with the Rust backend so it physically stops/starts watching the folder,
- * and permanently saves the user's preference to the config file.
  */
 const toggleProcessing = async () => {
-  isPermanentScan.value = !isPermanentScan.value;
+  isProcessing.value = !isProcessing.value;
   try {
-    const config: any = await invoke('get_config');
-    if (!config.flags) config.flags = {};
-    config.flags.isPermanentScan = isPermanentScan.value;
-    
-    await invoke('save_config', { config });
-    await invoke('set_scan_state', { active: isPermanentScan.value });
+    await invoke('set_scan_state', { active: isProcessing.value });
   } catch (e) {
     console.error("Failed to sync state with Rust:", e);
   }
@@ -212,6 +210,7 @@ onMounted(async () => {
     if (config.flags) {
         if (typeof config.flags.isPermanentScan === 'boolean') {
           isPermanentScan.value = config.flags.isPermanentScan;
+          isProcessing.value = config.flags.isPermanentScan;
         }
         if (typeof config.flags.autoUpdateEnabled === 'boolean') {
           autoUpdateEnabled.value = config.flags.autoUpdateEnabled;
@@ -236,7 +235,7 @@ onMounted(async () => {
 
   // 6. Setup native drag-and-drop file interception
   try {
-    await getCurrentWindow().onDragDropEvent(async (event) => {
+    unlistenDragDrop = await getCurrentWindow().onDragDropEvent(async (event) => {
       if (event.payload.type === 'over' || event.payload.type === 'enter') {
         isDragging.value = true;
       } else if (event.payload.type === 'leave') {
@@ -259,6 +258,37 @@ onMounted(async () => {
     console.warn("Could not bind drag and drop listener", e);
   }
 });
+
+onUnmounted(() => {
+  unlistenDragDrop?.();
+});
+
+watch(() => appState.value, async (newState) => {
+  if (!isPermanentScan.value && isProcessing.value && newState === 'welcome') {
+    if (queueCount.value === 0 && offlineQueueCount.value === 0) {
+      isProcessing.value = false;
+      try {
+        await invoke('set_scan_state', { active: false });
+      } catch (e) {
+        console.error("Failed to terminate scan state:", e);
+      }
+    }
+  }
+});
+
+watch([queueCount, isProcessing], ([newQueue, newProcessing]) => {
+  if (!isPermanentScan.value && !newProcessing && newQueue === 0) {
+    clearTimeout(terminateTimeout);
+    terminateTimeout = window.setTimeout(() => {
+      // If we are in manual mode, the user clicked Terminate (isProcessing is false), 
+      // and the final image just finished processing (queue hit 0), force the welcome screen.
+      if (!isProcessing.value && queueCount.value === 0) {
+        appState.value = 'welcome';
+      }
+      
+    }, 4000);
+  }
+});
 </script>
 
 <template>
@@ -274,9 +304,10 @@ onMounted(async () => {
         class="header-play-btn"
         :class="{ breathing: isBreathing }"
         @click="toggleProcessing"
-        :title="isProcessing ? 'Pause' : 'Run'"
+        :title="isProcessing ? (isPermanentScan ? 'Pause' : 'Terminate') : 'Run'"
       >
-        <PauseIcon v-if="isProcessing" :size="18" />
+        <PauseIcon v-if="isProcessing && isPermanentScan" :size="18" />
+        <SquareIcon v-else-if="isProcessing && !isPermanentScan" :size="18" fill="currentColor" />
         <PlayIcon v-else :size="18" fill="currentColor" />
       </button>
     </header>
