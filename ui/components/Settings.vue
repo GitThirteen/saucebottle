@@ -31,7 +31,7 @@ import { open, ask } from '@tauri-apps/plugin-dialog';
 import { enable, disable, isEnabled } from '@tauri-apps/plugin-autostart';
 import { openUrl } from '@tauri-apps/plugin-opener';
 
-import { isPermanentScan, confidenceThreshold, autoUpdateEnabled, isProcessing } from '../store';
+import { isPermanentScan, confidenceThreshold, autoUpdateEnabled } from '../store';
 
 // ---------------------------------*
 // ---- META & INTERNAL STATE ------*
