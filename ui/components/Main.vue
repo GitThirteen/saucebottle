@@ -19,6 +19,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 <script setup lang="ts">
 import { ref, watch, onUnmounted, computed } from 'vue';
 import { DropletIcon, AlertTriangleIcon, DownloadCloudIcon, ClockIcon } from 'lucide-vue-next';
+import { invoke } from '@tauri-apps/api/core';
+import { join, pictureDir } from '@tauri-apps/api/path';
 import { 
   appState, 
   queueCount, 
@@ -47,6 +49,20 @@ const tips = [
   "Tip: Click the Terminal icon at the bottom to check the live logs if a process seems stuck.",
   "Tip: Can't find your sorted images? Check the 'SauceBottle' folder inside your OS Pictures directory.",
 ];
+
+const panickingKaomojis = [
+  "ε=ε=ε=ε=┌(;￣▽￣)┘",
+  "ε=ε=ε=┏(゜ロ゜;)┛",
+  "ヽ(￣д￣;)ノ=3=3=3",
+  "(;° ロ°) 💨",
+  "C= C= C=┌( `ー´)┘"
+];
+
+const isImageMovedTooFast = ref(false);
+const currentKaomoji = ref('');
+
+const showCopied = ref(false);
+let copyTimeout: number;
 
 const currentTip = ref(tips[0]);
 let tipInterval: number;
@@ -85,6 +101,10 @@ watch(() => appState.value, (newState) => {
   }
 });
 
+watch(() => activeImage.value, () => {
+  isImageMovedTooFast.value = false;
+});
+
 // ---------------------------------*
 // ---- LIFECYCLE ------------------*
 // ---------------------------------*
@@ -92,19 +112,40 @@ watch(() => appState.value, (newState) => {
 onUnmounted(() => {
   clearInterval(tipInterval);
   clearTimeout(slowNetworkTimer);
+  clearTimeout(copyTimeout);
 });
 
 // ---------------------------------*
 // ---- METHODS --------------------*
 // ---------------------------------*
 
-/**
- * Fallback handler if the processing image gets corrupted before rendering.
- */
-const handleImageError = () => {
-  if (appState.value !== 'welcome') {
-    appState.value = 'welcome';
+const copyPathToClipboard = async () => {
+  try {
+    const config: any = await invoke('get_config');
+    let basePath = config.output_folder;
+
+    if (!basePath || basePath.trim() === '') {
+      const picDir = await pictureDir();
+      basePath = await join(picDir, 'SauceBottle');
+    }
+
+    const absolutePath = await join(basePath, resultData.value.dest);
+
+    await navigator.clipboard.writeText(absolutePath);
+    showCopied.value = true;
+    
+    clearTimeout(copyTimeout);
+    copyTimeout = window.setTimeout(() => {
+      showCopied.value = false;
+    }, 2000);
+  } catch (err) {
+    console.error("Failed to copy absolute path:", err);
   }
+};
+
+const handleImageError = () => {
+  currentKaomoji.value = panickingKaomojis[Math.floor(Math.random() * panickingKaomojis.length)];
+  isImageMovedTooFast.value = true;
 };
 </script>
 
@@ -157,7 +198,13 @@ const handleImageError = () => {
         </div>
         
         <div class="image-wrapper unselectable">
-          <img :src="activeImage" alt="Current Image" @error="handleImageError" />
+          <div v-if="isImageMovedTooFast" class="overdrive-container">
+            <div class="kaomoji-text run-anim">{{ currentKaomoji }}</div>
+            <h3 class="overdrive-title">IQDB is in Overdrive!</h3>
+            <p class="overdrive-subtext">The server returned the result faster than we could display the image.</p>
+          </div>
+
+          <img v-else :key="activeImage" :src="activeImage" alt="Current Image" @error="handleImageError" />
         </div>
 
         <transition name="panel-slide" mode="out-in">
@@ -195,9 +242,18 @@ const handleImageError = () => {
               <span class="unselectable service-source">{{ resultData.service }}</span>
             </div>
             
-            <div class="destination-box">
+            <div 
+              class="destination-box copyable" 
+              :title="resultData.dest"
+              @mouseup="copyPathToClipboard"
+              @contextmenu.prevent
+            >
               <span class="icon">📁</span>
               <code class="path">{{ resultData.dest }}</code>
+              
+              <transition name="fade">
+                <span v-if="showCopied" class="copied-badge">Copied!</span>
+              </transition>
             </div>
           </div>
 
@@ -525,12 +581,39 @@ const handleImageError = () => {
   padding: 10px 15px; 
   border-radius: 8px; 
   border: 1px dashed var(--text-tertiary); 
+  position: relative;
 }
-.destination-box .path { 
-  font-family: monospace; 
-  color: var(--accent-primary); 
-  font-size: 0.85rem; 
-  font-weight: 700; 
+.destination-box.copyable {
+  cursor: pointer;
+  transition: border-color 0.2s ease, background 0.2s ease;
+}
+.destination-box.copyable:hover {
+  border-color: var(--accent-primary);
+  background: rgba(255, 75, 43, 0.05);
+}
+.destination-box .path {
+  font-family: monospace;
+  color: var(--accent-primary);
+  font-size: 0.85rem;
+  font-weight: 700;
+
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.copied-badge {
+  position: absolute;
+  right: 15px;
+  background: rgba(0, 230, 118, 0.25); 
+  color: #00e676;
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-size: 0.75rem;
+  font-weight: 800;
+  border: 1px solid rgba(0, 230, 118, 0.4);
+  pointer-events: none; 
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
 }
 
 /* -- STATE 3: ERROR PANEL -- */
@@ -681,6 +764,58 @@ const handleImageError = () => {
   33% { transform: translateY(-4px) scale(1.05) rotate(4deg); }
   66% { transform: translateY(-2px) scale(0.95) rotate(-4deg); }
 }
+
+/* -- OVERDRIVE MODE -- */
+.overdrive-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 20px;
+  width: 100%;
+  height: 100%;
+  background: repeating-linear-gradient(
+    45deg,
+    rgba(0, 0, 0, 0.2),
+    rgba(0, 0, 0, 0.2) 10px,
+    rgba(255, 75, 43, 0.05) 10px,
+    rgba(255, 75, 43, 0.05) 20px
+  );
+}
+
+.kaomoji-text {
+  font-size: 2rem;
+  color: var(--accent-primary);
+  margin-bottom: 18px;
+  font-family: monospace;
+  white-space: nowrap;
+}
+
+.overdrive-title {
+  margin: 0 0 5px 0;
+  font-size: 1.2rem;
+  color: var(--text-primary);
+  font-weight: 800;
+}
+
+.overdrive-subtext {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  max-width: 80%;
+  line-height: 1.4;
+}
+
+.run-anim {
+  animation: run-bob 0.4s infinite alternate linear;
+}
+
+@keyframes run-bob {
+  0% { transform: translateY(0) translateX(-5px) rotate(-2deg); }
+  100% { transform: translateY(-5px) translateX(5px) rotate(2deg); }
+}
+
 
 /* -- ANIMATIONS & TRANSITIONS -- */
 @keyframes float { 
