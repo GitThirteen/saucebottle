@@ -82,10 +82,17 @@ const badgeClass = computed(() => {
 
 watch(() => appState.value, (newState) => {
   if (newState === 'updating') {
-    let index = 0;
+    let currentIndex = tips.indexOf(currentTip.value);
+
     tipInterval = window.setInterval(() => {
-      index = (index + 1) % tips.length;
-      currentTip.value = tips[index];
+      let newIndex;
+      
+      do {
+        newIndex = Math.floor(Math.random() * tips.length);
+      } while (newIndex === currentIndex && tips.length > 1);
+
+      currentIndex = newIndex;
+      currentTip.value = tips[currentIndex];
     }, 6000);
   } else {
     clearInterval(tipInterval);

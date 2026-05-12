@@ -39,6 +39,14 @@ jobs:
       - name: Install frontend dependencies
         run: npm install
 
+      - name: Read Patch Notes
+        id: get_notes
+        shell: bash
+        run: |
+          echo "notes<<EOF" >> $GITHUB_OUTPUT
+          cat PATCH_NOTES.md >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
       - name: Build and Release SauceBottle
         uses: tauri-apps/tauri-action@v0.5.16
         env:
@@ -48,7 +56,7 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "SauceBottle ${{ github.ref_name }}"
-          releaseBody: "A new version of SauceBottle is available! See the assets below to download."
+          releaseBody: ${{ steps.get_notes.outputs.notes }}
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.platform == 'macos-latest' && '--target universal-apple-darwin' || '' }}
