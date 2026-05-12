@@ -52,7 +52,20 @@ async fn wait_for_file_ready(path: &PathBuf) -> Result<(), &'static str> {
             Ok(_) => {
                 return Ok(());
             }
-            Err(_) => {
+            Err(error) => {
+                // Cloud transfers often flag files as Read-Only.
+                // If it's read-only, append(true) will always fail.
+                if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    if let Ok(metadata) = std::fs::metadata(path) {
+                        if metadata.permissions().readonly() {
+                            // Ensure we can at least read it before giving the green light
+                            if std::fs::OpenOptions::new().read(true).open(path).is_ok() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+
                 if start_time.elapsed() > timeout {
                     return Err("Timed out waiting for file to finish writing to disk.");
                 }
@@ -61,8 +74,8 @@ async fn wait_for_file_ready(path: &PathBuf) -> Result<(), &'static str> {
 
                 // Increase the delay by x1.5 for the next loop, capping at max_delay
                 current_delay = std::cmp::min(
-                current_delay.mul_f32(1.5), 
-                max_delay
+                    current_delay.mul_f32(1.5), 
+                    max_delay
                 );
             }
         }

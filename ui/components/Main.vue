@@ -699,7 +699,7 @@ const handleImageError = () => {
 /* -- RARE EASTER EGG TEXT -- */
 .rainbow-text {
   display: inline-block;
-  font-size: 1.4rem;
+  font-size: 1.1rem;
   text-transform: uppercase;
   white-space: pre-wrap;
 }
