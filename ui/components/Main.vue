@@ -18,7 +18,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 <script setup lang="ts">
 import { ref, watch, onUnmounted, computed } from 'vue';
-import { DropletIcon, AlertTriangleIcon, DownloadCloudIcon } from 'lucide-vue-next';
+import { DropletIcon, AlertTriangleIcon, DownloadCloudIcon, ClockIcon } from 'lucide-vue-next';
 import { 
   appState, 
   queueCount, 
@@ -51,6 +51,9 @@ const tips = [
 const currentTip = ref(tips[0]);
 let tipInterval: number;
 
+const isSlowNetwork = ref(false);
+let slowNetworkTimer: number;
+
 // ---------------------------------*
 // ---- COMPUTED & WATCHERS --------*
 // ---------------------------------*
@@ -71,6 +74,15 @@ watch(() => appState.value, (newState) => {
   } else {
     clearInterval(tipInterval);
   }
+
+  clearTimeout(slowNetworkTimer);
+  isSlowNetwork.value = false;
+
+  if (newState === 'processing') {
+    slowNetworkTimer = window.setTimeout(() => {
+      isSlowNetwork.value = true;
+    }, 12000);
+  }
 });
 
 // ---------------------------------*
@@ -79,6 +91,7 @@ watch(() => appState.value, (newState) => {
 
 onUnmounted(() => {
   clearInterval(tipInterval);
+  clearTimeout(slowNetworkTimer);
 });
 
 // ---------------------------------*
@@ -98,7 +111,6 @@ const handleImageError = () => {
 <template>
   <div class="main-view">
     <transition name="fade" mode="out-in">
-      
       <div v-if="appState === 'welcome'" class="welcome-card unselectable">
         <div class="icon-ring organic-blob">
           <DropletIcon :size="32" class="organic-icon" fill="currentColor" />
@@ -196,6 +208,13 @@ const handleImageError = () => {
           </div>
 
         </transition>
+      </div>
+    </transition>
+
+    <transition name="toast-pop">
+      <div v-if="isSlowNetwork" class="slow-network-banner unselectable">
+        <ClockIcon :size="20" class="pulse-icon banner-icon" />
+        <span>The IQDB servers are handling a lot of orders right now. Please be patient, your sauce will be out shortly.</span>
       </div>
     </transition>
   </div>
@@ -545,6 +564,53 @@ const handleImageError = () => {
   line-height: 1.4; 
   font-family: monospace; 
   max-width: 90%; 
+}
+
+.slow-network-banner {
+  position: fixed;
+  top: 80px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 100;
+  
+  width: calc(100% - 20px);
+  box-sizing: border-box;
+  
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  background: rgba(245, 197, 66, 0.15);
+  color: #f5c542;
+  padding: 12px 18px;
+  
+  border-radius: 12px; 
+  border: 1px dashed rgba(245, 197, 66, 0.3);
+  backdrop-filter: blur(8px); 
+  
+  text-align: center;
+  font-size: 0.75rem;
+  font-weight: 700;
+  line-height: 1.5;
+}
+
+.banner-icon {
+  flex-shrink: 0;
+}
+
+.toast-pop-enter-active, 
+.toast-pop-leave-active {
+  transition: opacity 0.3s ease, transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+
+.toast-pop-enter-from, 
+.toast-pop-leave-to {
+  opacity: 0;
+  transform: translate(-50%, -20px); 
+}
+
+.pulse-icon {
+  animation: pulse-anim 2s infinite;
 }
 
 /* -- RARE EASTER EGG TEXT -- */

@@ -80,6 +80,7 @@ impl Default for AppConfig {
         let mut flags = HashMap::new();
         flags.insert("applyModsToSaved".to_string(), false);
         flags.insert("runOnBoot".to_string(), false);
+        flags.insert("startMinimized".to_string(), false);
         flags.insert("listDupes".to_string(), true);
         flags.insert("allowImageConversion".to_string(), true);
         flags.insert("allowShrinking".to_string(), true);

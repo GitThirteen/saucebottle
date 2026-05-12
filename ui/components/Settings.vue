@@ -52,9 +52,10 @@ const hiddenServices = ref({});
 // -- System Settings --
 const autostart = ref(false);
 const flags = ref({ 
-  allowResizing: true, 
-  allowShrinking: true, 
-  allowImageConversion: true, 
+  allowResizing: true,
+  allowShrinking: true,
+  startMinimized: false,
+  allowImageConversion: true,
   listDupes: true,
   applyModsToSaved: false
 });
@@ -321,6 +322,13 @@ const handleApplyModsChange = async (e: Event) => {
         <div class="info-wrapper">
           <InfoIcon :size="14" class="info-icon" />
           <span class="tooltip">Launch SauceBottle in the background automatically when your computer starts.</span>
+        </div>
+      </label>
+      <label class="checkbox-label">
+        <input type="checkbox" v-model="flags.startMinimized" /> Start minimized
+        <div class="info-wrapper">
+          <InfoIcon :size="14" class="info-icon" />
+          <span class="tooltip">Launch SauceBottle quietly in the system tray without opening the main window.</span>
         </div>
       </label>
       <label class="checkbox-label">

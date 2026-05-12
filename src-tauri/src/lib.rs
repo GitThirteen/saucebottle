@@ -665,6 +665,14 @@ pub fn run() {
             } else {
                 let _ = autolaunch.disable();
             }
+
+            let start_minimized = config.flags.get("startMinimized").copied().unwrap_or(false);
+            if !start_minimized {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
             
             let pic_dir = app.path().picture_dir().expect("Failed to resolve Pictures directory");
             let saucebottle_dir = pic_dir.join("SauceBottle");

@@ -16,6 +16,7 @@
         "width": 400,
         "height": 700,
         "resizable": false,
+        "visible": false,
         "maximizable": false,
         "fullscreen": false,
         "alwaysOnTop": true
