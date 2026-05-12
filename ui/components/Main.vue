@@ -20,7 +20,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 import { ref, watch, onUnmounted, computed } from 'vue';
 import { DropletIcon, AlertTriangleIcon, DownloadCloudIcon, ClockIcon } from 'lucide-vue-next';
 import { invoke } from '@tauri-apps/api/core';
-import { join, pictureDir } from '@tauri-apps/api/path';
+import { join, pictureDir, dirname } from '@tauri-apps/api/path';
 import { 
   appState, 
   queueCount, 
@@ -50,7 +50,7 @@ const tips = [
   "Tip: Can't find your sorted images? Check the 'SauceBottle' folder inside your OS Pictures directory.",
 ];
 
-const panickingKaomojis = [
+const kaomojis = [
   "ε=ε=ε=ε=┌(;￣▽￣)┘",
   "ε=ε=ε=┏(゜ロ゜;)┛",
   "ヽ(￣д￣;)ノ=3=3=3",
@@ -126,21 +126,24 @@ onUnmounted(() => {
 // ---- METHODS --------------------*
 // ---------------------------------*
 
+const getAbsoluteDestinationPath = async () => {
+  const config: any = await invoke('get_config');
+  let basePath = config.output_folder;
+
+  if (!basePath || basePath.trim() === '') {
+    const picDir = await pictureDir();
+    basePath = await join(picDir, 'SauceBottle', 'results');
+  }
+
+  return await join(basePath, resultData.value.dest);
+};
+
 const copyPathToClipboard = async () => {
   try {
-    const config: any = await invoke('get_config');
-    let basePath = config.output_folder;
-
-    if (!basePath || basePath.trim() === '') {
-      const picDir = await pictureDir();
-      basePath = await join(picDir, 'SauceBottle');
-    }
-
-    const absolutePath = await join(basePath, resultData.value.dest);
-
+    const absolutePath = await getAbsoluteDestinationPath();
     await navigator.clipboard.writeText(absolutePath);
-    showCopied.value = true;
     
+    showCopied.value = true;
     clearTimeout(copyTimeout);
     copyTimeout = window.setTimeout(() => {
       showCopied.value = false;
@@ -150,8 +153,19 @@ const copyPathToClipboard = async () => {
   }
 };
 
+const openDestinationFolder = async () => {
+  try {
+    const absolutePath = await getAbsoluteDestinationPath();
+    const folderPath = await dirname(absolutePath);
+    
+    await invoke('open_system_folder', { folderTarget: folderPath });
+  } catch (err) {
+    console.error("Failed to open destination folder:", err);
+  }
+};
+
 const handleImageError = () => {
-  currentKaomoji.value = panickingKaomojis[Math.floor(Math.random() * panickingKaomojis.length)];
+  currentKaomoji.value = kaomojis[Math.floor(Math.random() * kaomojis.length)];
   isImageMovedTooFast.value = true;
 };
 </script>
@@ -251,9 +265,9 @@ const handleImageError = () => {
             
             <div 
               class="destination-box copyable" 
-              :title="resultData.dest"
-              @mouseup="copyPathToClipboard"
-              @contextmenu.prevent
+              :title="resultData.dest + '\nLeft-click to open folder\nRight-click to copy path'"
+              @click="openDestinationFolder"
+              @contextmenu.prevent="copyPathToClipboard"
             >
               <span class="icon">📁</span>
               <code class="path">{{ resultData.dest }}</code>

@@ -528,27 +528,33 @@ fn open_system_folder(
 ) -> Result<(), String> {
     let config = state.config.lock().unwrap().clone();
 
-    // Resolve the base results directory
-    let mut target_dir = std::path::PathBuf::from(&config.output_folder);
+    let mut target_dir;
 
-    // If the user hasn't set a custom folder, use Pictures/SauceBottle/results as fallback
-    if target_dir.as_os_str().is_empty() {
-        let pic_dir = handle
-            .path()
-            .picture_dir()
-            .map_err(|_| "Failed to resolve OS Pictures directory".to_string())?;
+    // Check if it's a known UI keyword, otherwise treat it as a raw absolute path
+    if folder_target == "results" || folder_target == "downloads" {
+        target_dir = std::path::PathBuf::from(&config.output_folder);
+        
+        // If the user hasn't set a custom folder, use Pictures/SauceBottle/results as fallback
+        if target_dir.as_os_str().is_empty() {
+            let pic_dir = handle
+                .path()
+                .picture_dir()
+                .map_err(|_| "Failed to resolve OS Pictures directory".to_string())?;
 
-        target_dir = pic_dir.join("SauceBottle").join("results");
-    }
+            target_dir = pic_dir.join("SauceBottle").join("results");
+        }
 
-    // Append the downloads folder if requested
-    if folder_target == "downloads" {
-        let dl_folder = if config.downloads_folder.trim().is_empty() {
-            ".downloads"
-        } else {
-            &config.downloads_folder
-        };
-        target_dir = target_dir.join(dl_folder);
+        // Append the downloads folder if requested
+        if folder_target == "downloads" {
+            let dl_folder = if config.downloads_folder.trim().is_empty() {
+                ".downloads"
+            } else {
+                &config.downloads_folder
+            };
+            target_dir = target_dir.join(dl_folder);
+        }
+    } else {
+        target_dir = std::path::PathBuf::from(folder_target);
     }
 
     // Ensure the directory actually exists so the OS doesn't throw an error
