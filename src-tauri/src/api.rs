@@ -584,13 +584,14 @@ impl ApiClient {
         let valid_lower: Vec<String> = valid_services.iter().map(|s| s.to_lowercase()).collect();
 
         for table in document.select(&table_sel) {
-            let Some(th) = table.select(&th_sel).next() else { // Skip if there is no table header
+            // Skip if there is no table header
+            let Some(th) = table.select(&th_sel).next() else {
                 continue; 
             };
 
+            // Skip if the header doesn't indicate a match
             let header_text = th.text().collect::<Vec<_>>().join(" ").to_lowercase();
-
-            if !header_text.contains("match") { // Skip if the header doesn't indicate a match
+            if !header_text.contains("match") {
                 continue;
             }
 
@@ -600,44 +601,45 @@ impl ApiClient {
                 .and_then(|cap| cap[1].parse::<u8>().ok())
                 .unwrap_or(0);
 
-            if similarity > highest_similarity {
-                highest_similarity = similarity;
-            }
-
-            if similarity < threshold { // Skip if it doesn't meet the user's threshold
-                continue;
-            }
-
             for a_tag in table.select(&a_sel) {
-                let Some(href) = a_tag.value().attr("href") else { 
+                // Skip if no href tag
+                let Some(href) = a_tag.value().attr("href") else {
                     continue; 
                 };
 
+                let href_lower = href.to_lowercase();
+                let is_supported = href_lower.contains("danbooru")
+                    || href_lower.contains("gelbooru")
+                    || href_lower.contains("yande.re");
+
+                // Skip if unsupported service
+                if !is_supported {
+                    continue;
+                }
+
+                // Skip if it doesn't meet the user's threshold
+                highest_similarity = highest_similarity.max(similarity);
+                if similarity < threshold {
+                    continue;
+                }
+
                 match self.extract_service_and_id(href) {
                     Ok((srv, id)) => {
-                        if valid_lower.contains(&srv.to_lowercase()) {
+                        let is_configured = valid_lower.contains(&srv.to_lowercase());
+
+                        if is_configured {
                             if best_match.as_ref().is_none_or(|t| similarity > t.2) {
                                 best_match = Some((srv, id, similarity));
                             }
-                        } else {
-                            // It's a supported service (like Danbooru) but the user hasn't added API keys
+                        } else { // It's a supported service (like Danbooru) but the user hasn't added API keys
                             if best_unconfigured_match.as_ref().is_none_or(|t| similarity > t.1) {
                                 best_unconfigured_match = Some((srv, similarity));
                             }
                         }
                     }
                     Err(parse_error) => {
-                        let href_lower = href.to_lowercase();
-                        
-                        // Only warn if it's a SauceBottle-supported service that we failed to parse.
-                        let is_supported = href_lower.contains("danbooru") 
-                            || href_lower.contains("gelbooru") 
-                            || href_lower.contains("yande.re");
-
-                        if is_supported {
-                            let msg = format!("IQDB returned a link, but SauceBottle failed to parse it: {}", parse_error);
-                            let _ = handle.emit("warn", msg);
-                        }
+                        let msg = format!("IQDB returned a link, but SauceBottle failed to parse it: {}", parse_error);
+                        let _ = handle.emit("warn", msg);
                     }
                 }
             }
