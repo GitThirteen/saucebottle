@@ -208,7 +208,7 @@ fn get_credential(service: &str) -> Result<String, String> {
 /// # Returns
 /// * `bool` - `true` if the file has a valid image extension.
 fn is_valid_image(path: &Path) -> bool {
-    let valid_exts = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff"];
+    let valid_exts = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "jfif", "ico", "tga", "avif", "heic", "heif"];
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         return valid_exts.contains(&ext.to_lowercase().as_str());
     }

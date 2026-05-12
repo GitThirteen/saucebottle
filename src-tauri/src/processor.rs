@@ -83,26 +83,42 @@ pub fn process_image(path: &Path) -> Result<ImageInfo, String> {
     let metadata = fs::metadata(path).map_err(|e| e.to_string())?;
     let size_kb = metadata.len() / 1024;
 
+    let clean_path = path.to_string_lossy().replace("\\\\?\\", "");
+    let filename = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+
+    // Intercept HEIC/HEIF (thank you Nokia)
+    if ext == "heic" || ext == "heif" {
+        let data = fs::read(path).map_err(|e| e.to_string())?;
+        
+        // Read the headers without decoding the whole image
+        let info = heic::ImageInfo::from_bytes(&data)
+            .map_err(|e| format!("HEIC header error: {:?}", e))?;
+        
+        return Ok(ImageInfo {
+            path: clean_path,
+            filename,
+            format: "HEIC".to_string(),
+            width: info.width,
+            height: info.height,
+            size_kb,
+        });
+    }
+
     let reader = ImageReader::open(path)
         .map_err(|e| e.to_string())?
         .with_guessed_format()
         .map_err(|e| format!("Failed to read image headers: {}", e))?;
 
     let format = reader.format().ok_or("Unrecognized image format")?;
-    let dimensions = reader.into_dimensions().map_err(|e| e.to_string())?;
-
-    let clean_path = path.to_string_lossy().replace("\\\\?\\", "");
+    let (width, height) = reader.into_dimensions().map_err(|e| e.to_string())?;
 
     Ok(ImageInfo {
         path: clean_path,
-        filename: path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned(),
+        filename,
         format: format!("{:?}", format),
-        width: dimensions.0,
-        height: dimensions.1,
+        width,
+        height,
         size_kb,
     })
 }
@@ -138,7 +154,7 @@ pub fn get_iqdb_payload(
     // 2. Identify if it needs conversion (IQDB natively accepts JPEG, PNG, GIF)
     let needs_conversion = matches!(
         info.format.to_lowercase().as_str(),
-        "webp" | "bmp" | "tiff" | "ico" | "tga"
+        "webp" | "bmp" | "tiff" | "ico" | "tga" | "avif" | "heic" | "heif"
     );
 
     // 3. Identify if it breaks IQDB's hard 7500x7500 pixel limit
@@ -167,12 +183,31 @@ pub fn get_iqdb_payload(
     }
 
     // --- PROCESSING PIPELINE ---
-    let mut img = ImageReader::open(path)
-        .map_err(|e| format!("Failed to open file: {}", e))?
-        .with_guessed_format()
-        .map_err(|e| format!("Failed to read image headers: {}", e))?
-        .decode()
-        .map_err(|e| format!("Failed to decode image for processing: {}", e))?;
+    let mut img = if info.format == "HEIC" {
+        
+        let data = fs::read(path).map_err(|e| e.to_string())?;
+        let header = heic::ImageInfo::from_bytes(&data).map_err(|e| format!("HEIC error: {:?}", e))?;
+        let mut buf = vec![0u8; header.output_buffer_size(heic::PixelLayout::Rgb8).unwrap()];
+        
+        let (w, h) = heic::DecoderConfig::new()
+            .decode_request(&data)
+            .with_output_layout(heic::PixelLayout::Rgb8)
+            .decode_into(&mut buf)
+            .map_err(|e| format!("HEIC decode failed: {:?}", e))?;
+
+        let img_buffer = image::RgbImage::from_raw(w, h, buf)
+            .ok_or("Failed to convert raw HEIC buffer into ImageBuffer")?;
+            
+        image::DynamicImage::ImageRgb8(img_buffer)
+        
+    } else {
+        ImageReader::open(path)
+            .map_err(|e| format!("Failed to open file: {}", e))?
+            .with_guessed_format()
+            .map_err(|e| format!("Failed to read image headers: {}", e))?
+            .decode()
+            .map_err(|e| format!("Failed to decode image for processing: {}", e))?
+    };
 
     // 5. Resolve Dimensions
     if needs_resize {
