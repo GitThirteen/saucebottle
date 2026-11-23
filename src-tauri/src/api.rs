@@ -16,6 +16,7 @@
 
 use std::fmt::Write;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 
 use keyring_core::Entry;
 use regex::Regex;
@@ -33,6 +34,50 @@ use crate::models::{AppConfig, BooruResponse};
 static SIMILARITY_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)%").unwrap());
 static YEAR_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(19|20)\d{2}\b").unwrap());
 
+// ---- HTTP -----------------------*
+
+/// Give up connecting to a server after this long.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Give up when a server stops sending data for this long. Resets with every received chunk,
+/// so large but steadily progressing downloads aren't affected.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// Hard cap for small API calls (JSON/HTML lookups).
+pub const API_TIMEOUT: Duration = Duration::from_secs(60);
+/// Hard cap for IQDB lookups, which include uploading an image of up to 8MB.
+const IQDB_TIMEOUT: Duration = Duration::from_secs(180);
+
+// Without timeouts, a single stalled request would block the (single) processing worker forever.
+static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
+        .build()
+        .expect("Failed to build HTTP client")
+});
+
+/// Returns the shared HTTP client (cheap to clone, shares one connection pool).
+pub fn http_client() -> reqwest::Client {
+    HTTP_CLIENT.clone()
+}
+
+/// Turns a request error into a user-facing message.
+/// reqwest appends the full request URL to its errors, and our booru URLs carry the user's
+/// API key as a query parameter - so the URL is stripped before anything reaches the UI or logs.
+/// The underlying causes (e.g. "operation timed out") are appended, since reqwest's own
+/// message is often just "error sending request".
+pub fn describe_http_error(error: reqwest::Error) -> String {
+    let error = error.without_url();
+    let mut message = error.to_string();
+
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        let _ = write!(message, ": {}", cause);
+        source = cause.source();
+    }
+
+    message
+}
+
 // ---- Helpers --------------------*
 
 /// Calculates the Levenshtein distance, also known as the edit distance, between two strings.
@@ -46,15 +91,19 @@ static YEAR_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(19|20)\d{2
 /// # Returns:
 /// * `usize` - The total number of edits required.
 fn levenshtein_distance(a: &str, b: &str) -> usize {
+    // Work on characters, not bytes, otherwise every non-ASCII tag (e.g. Japanese) breaks the table
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+
     let mut dp = vec![vec![0; b.len() + 1]; a.len() + 1];
-    for i in 0..=a.len() {
-        dp[i][0] = i;
+    for (i, row) in dp.iter_mut().enumerate() {
+        row[0] = i;
     }
-    for j in 0..=b.len() {
-        dp[0][j] = j;
+    for (j, cell) in dp[0].iter_mut().enumerate() {
+        *cell = j;
     }
-    for (i, ca) in a.chars().enumerate() {
-        for (j, cb) in b.chars().enumerate() {
+    for (i, &ca) in a.iter().enumerate() {
+        for (j, &cb) in b.iter().enumerate() {
             let cost = usize::from(ca != cb);
             dp[i + 1][j + 1] = *[dp[i][j + 1] + 1, dp[i + 1][j] + 1, dp[i][j] + cost]
                 .iter()
@@ -92,10 +141,12 @@ fn process_blacklist_rules(tag: &str, blacklist: &[String], handle: &tauri::AppH
             let _ = handle.emit("warn", msg.clone());
         }
 
-        let length_diff = tag_lower.len().abs_diff(b.len());
+        let tag_len = tag_lower.chars().count();
+        let blacklist_len = b.chars().count();
+        let length_diff = tag_len.abs_diff(blacklist_len);
 
         // Determine how many typos we tolerate based on the blacklist tag's length
-        let max_dist: usize = match b.len() {
+        let max_dist: usize = match blacklist_len {
             0..=4 => 1,
             5..=9 => 2,
             _ => 3,
@@ -124,7 +175,7 @@ fn process_blacklist_rules(tag: &str, blacklist: &[String], handle: &tauri::AppH
 ///
 /// # Returns
 /// * `String` - The URL-encoded string.
-fn url_encode(input: &str) -> String {
+pub fn url_encode(input: &str) -> String {
     let mut encoded = String::new();
     for byte in input.bytes() {
         match byte {
@@ -188,7 +239,7 @@ impl ApiClient {
     pub fn new(config: Arc<Mutex<Arc<AppConfig>>>) -> Self {
         Self {
             config,
-            client: reqwest::Client::new(),
+            client: http_client(),
         }
     }
 
@@ -272,9 +323,10 @@ impl ApiClient {
         let res = self.client.post("https://www.iqdb.org/")
             .header("User-Agent", saucebottle_agent)
             .multipart(form)
+            .timeout(IQDB_TIMEOUT)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("IQDB request failed: {}", describe_http_error(e)))?;
 
         if !res.status().is_success() {
             if res.status().as_u16() == 429 {
@@ -283,7 +335,10 @@ impl ApiClient {
             return Err(format!("IQDB Server Error: HTTP {}", res.status()));
         }
 
-        let html_content = res.text().await.map_err(|e| e.to_string())?;
+        let html_content = res
+            .text()
+            .await
+            .map_err(|e| format!("IQDB request failed: {}", describe_http_error(e)))?;
         let threshold = self.config().confidence_threshold;
 
         let (service, id, similarity) =
@@ -356,8 +411,8 @@ impl ApiClient {
 
         api_url = api_url
             .replace("${ID}", id)
-            .replace("${USERNAME}", &actual_username)
-            .replace("${API_KEY}", &actual_api_key);
+            .replace("${USERNAME}", &url_encode(&actual_username))
+            .replace("${API_KEY}", &url_encode(&actual_api_key));
 
         let user_agent = if actual_username.is_empty() {
             format!("SauceBottle/{} (https://github.com/GitThirteen/SauceBottle)", env!("CARGO_PKG_VERSION"))
@@ -369,10 +424,30 @@ impl ApiClient {
             .client
             .get(&api_url)
             .header("User-Agent", &user_agent)
+            .timeout(API_TIMEOUT)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
-        let json: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+            .map_err(|e| format!("{} request failed: {}", service, describe_http_error(e)))?;
+
+        // Booru error replies (bad credentials, deleted posts, rate limits, ...) often still parse
+        // as JSON. Without these checks they'd come out tagless and get filed as "Original".
+        if !res.status().is_success() {
+            return Err(format!("{} returned HTTP {} for post {}.", service, res.status(), id));
+        }
+
+        let json: serde_json::Value = res
+            .json()
+            .await
+            .map_err(|e| format!("{} returned an unexpected response: {}", service, describe_http_error(e)))?;
+
+        let post = match service {
+            "Gelbooru" => &json["post"][0],
+            "Yande.re" => &json[0],
+            _ => &json,
+        };
+        if post.get("id").is_none() {
+            return Err(format!("{} has no post {} (it may have been deleted).", service, id));
+        }
 
         let mut character = String::from("Original");
         let mut fandom = String::from("Unknown");
@@ -428,19 +503,33 @@ impl ApiClient {
 
                 let tag_url = post_url_template
                     .replace("${TAGS}", &formatted_tags)
-                    .replace("${USERNAME}", &actual_username)
-                    .replace("${API_KEY}", &actual_api_key);
+                    .replace("${USERNAME}", &url_encode(&actual_username))
+                    .replace("${API_KEY}", &url_encode(&actual_api_key));
 
-                if let Ok(tag_res) = self
+                // The post itself carries no tag categories, so without this lookup we can't tell
+                // characters from fandoms - fail instead of mis-sorting the image as "Original"
+                let tag_res = self
                     .client
                     .get(&tag_url)
                     .header("User-Agent", &user_agent)
+                    .timeout(API_TIMEOUT)
                     .send()
                     .await
-                    && let Ok(raw_text) = tag_res.text().await
-                    && let Ok(tag_json) = serde_json::from_str::<serde_json::Value>(&raw_text)
-                    && let Some(arr) = tag_json["tag"].as_array().or(tag_json.as_array())
-                {
+                    .map_err(|e| format!("Gelbooru tag lookup failed: {}", describe_http_error(e)))?;
+
+                if !tag_res.status().is_success() {
+                    return Err(format!("Gelbooru tag lookup failed: HTTP {}", tag_res.status()));
+                }
+
+                let raw_text = tag_res
+                    .text()
+                    .await
+                    .map_err(|e| format!("Gelbooru tag lookup failed: {}", describe_http_error(e)))?;
+                let tag_json = serde_json::from_str::<serde_json::Value>(&raw_text)
+                    .map_err(|_| "Gelbooru tag lookup returned an unexpected response.".to_string())?;
+
+                // A valid reply without a tag list just means none of the names were found
+                if let Some(arr) = tag_json["tag"].as_array().or(tag_json.as_array()) {
                     let filtered: Vec<_> = arr
                         .iter()
                         .filter(|t| {
@@ -487,15 +576,28 @@ impl ApiClient {
                 year = (1970 + (ts / 31556926)).to_string();
             }
 
-            // Scraping Yande.re's HTML directly
+            // Scraping Yande.re's HTML directly. The tag categories only exist there, so a failed
+            // fetch must not fall through to the "Original" defaults.
             let html_url = format!("https://yande.re/post/show/{}", id);
-            if let Ok(html_res) = self
+            let html_res = self
                 .client
                 .get(&html_url)
                 .header("User-Agent", &user_agent)
+                .timeout(API_TIMEOUT)
                 .send()
                 .await
-                && let Ok(html_text) = html_res.text().await
+                .map_err(|e| format!("Yande.re tag lookup failed: {}", describe_http_error(e)))?;
+
+            if !html_res.status().is_success() {
+                return Err(format!("Yande.re tag lookup failed: HTTP {}", html_res.status()));
+            }
+
+            let html_text = html_res
+                .text()
+                .await
+                .map_err(|e| format!("Yande.re tag lookup failed: {}", describe_http_error(e)))?;
+
+            // Scoped so the parsed document (which isn't `Send`) never lives across an `.await`
             {
                 let document = Html::parse_document(&html_text);
 
@@ -532,10 +634,12 @@ impl ApiClient {
         .to_string();
 
         let mut fandom = clean_tag(&fandom);
-        if fandom == "Unknown" || fandom == "Original" {
+        let is_original_work = fandom == "Unknown" || fandom == "Original";
+        if is_original_work {
+            // Same fallback the Settings tab shows for an empty field
             let fallback = live_cfg.original_folder.trim();
             fandom = if fallback.is_empty() {
-                "Original".to_string()
+                ".original".to_string()
             } else {
                 fallback.to_string()
             };
@@ -551,6 +655,7 @@ impl ApiClient {
             service: service.to_string(),
             similarity,
             file_path: String::new(),
+            is_original_work,
         })
     }
 

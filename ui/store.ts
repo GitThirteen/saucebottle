@@ -62,7 +62,7 @@ export const isRareMessage = ref(false);
 export const activeImage = ref('');
 export const errorMessage = ref('');
 export const resultData = ref({ 
-    name: '', fandom: '', artist: '', service: '', dest: '', conf: 0 
+    name: '', fandom: '', artist: '', service: '', dest: '', conf: 0, isOriginalWork: false
 });
 
 // -- Queue Tracking --
@@ -155,6 +155,9 @@ const runUILoop = async () => {
     isUILoopRunning = true;
 
     while (uiQueue.length > 0) {
+        // Processing already runs during the boot/update screen; just don't show it until that's done
+        while (appState.value === 'updating') await sleep(250);
+
         const event = uiQueue.shift()!;
 
         if (event.type === 'proc') {
@@ -192,7 +195,8 @@ const runUILoop = async () => {
                 artist:  p.artist,
                 service: p.service,
                 dest:    p.file_path,
-                conf:    p.similarity
+                conf:    p.similarity,
+                isOriginalWork: p.is_original_work
             };
 
             appState.value = 'result';

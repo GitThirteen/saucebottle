@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 -->
 
 <script setup lang="ts">
-import { ref, watch, onMounted, computed, nextTick } from 'vue';
+import { ref, watch, onMounted, onBeforeUnmount, computed, nextTick } from 'vue';
 import draggable from 'vuedraggable';
 import { 
   GripVerticalIcon, 
@@ -80,6 +80,28 @@ const invalidFolder = ref('.invalid');
 const blacklist = ref('');
 const downloadsFolder = ref('.downloads');
 
+// -- Unsaved Text Edits --
+// The text fields only commit on Enter / leaving the field (v-model.lazy), so half-typed paths
+// never become live. What's typed in the meantime is tracked here, so fields with edits that
+// haven't been saved yet can be highlighted.
+const textFields = { outputFolder, originalFolder, invalidFolder, downloadsFolder, blacklist };
+type TextField = keyof typeof textFields;
+const drafts = ref<Partial<Record<TextField, string>>>({});
+
+const trackDraft = (field: TextField, e: Event) => {
+  drafts.value[field] = (e.target as HTMLInputElement).value;
+};
+
+const isUnsaved = (field: TextField) => {
+  const draft = drafts.value[field];
+  return draft !== undefined && draft !== textFields[field].value;
+};
+
+// Once a value is committed (or set another way, e.g. via the folder picker), its draft is obsolete
+for (const [field, model] of Object.entries(textFields)) {
+  watch(model, () => { delete drafts.value[field as TextField]; });
+}
+
 // ---------------------------------*
 // ---- COMPUTED PROPERTIES --------*
 // ---------------------------------*
@@ -123,7 +145,7 @@ onMounted(async () => {
 
     renameBehavior.value = config.rename_behavior || 'site_id';
     duplicateBehavior.value = config.duplicate_behavior || 'rename_copy';
-    confidenceThreshold.value = config.confidence_threshold || 80;
+    confidenceThreshold.value = config.confidence_threshold ?? 80; // `??`, so a deliberate 0% survives
 
     if (config.flags && typeof config.flags.autoUpdateEnabled === 'boolean') {
       autoUpdateEnabled.value = config.flags.autoUpdateEnabled;
@@ -152,9 +174,48 @@ onMounted(async () => {
   }
 });
 
+/** How long to wait after the last change before saving (coalesces slider drags etc.). */
+const SAVE_DELAY_MS = 400;
+let saveTimeout: number | undefined;
+
+/**
+ * Sends the current settings to the Rust backend, which writes them to disk and makes them live.
+ */
+const saveConfig = async () => {
+  saveTimeout = undefined;
+
+  const payloadFlags = {
+    ...flags.value,
+    isPermanentScan: isPermanentScan.value,
+    autoUpdateEnabled: autoUpdateEnabled.value,
+    runOnBoot: autostart.value
+  };
+
+  const payload = {
+    services: hiddenServices.value,
+    flags: payloadFlags,
+    active_hierarchy: activeHierarchy.value,
+    available_blocks: availableBlocks.value,
+    rename_behavior: renameBehavior.value,
+    duplicate_behavior: duplicateBehavior.value,
+    confidence_threshold: confidenceThreshold.value,
+    output_folder: outputFolder.value,
+    original_folder: originalFolder.value,
+    invalid_folder: invalidFolder.value,
+    downloads_folder: downloadsFolder.value,
+    blacklist: blacklist.value,
+  };
+  
+  try {
+    await invoke('save_config', { config: payload });
+  } catch (e) {
+    console.error("Failed to save config", e);
+  }
+};
+
 /**
  * Deep Watcher: Automatically saves the configuration to disk (via Rust) 
- * whenever any settings reactive variable changes.
+ * shortly after any settings reactive variable changes.
  */
 watch(
   [
@@ -162,38 +223,23 @@ watch(
     duplicateBehavior, confidenceThreshold, outputFolder, originalFolder, 
     invalidFolder, downloadsFolder, blacklist, autostart
   ], 
-  async () => {
+  () => {
     // Prevent saving default states before the actual config is loaded
     if (!isDataLoaded.value) return;
 
-    const payloadFlags = {
-      ...flags.value,
-      isPermanentScan: isPermanentScan.value,
-      autoUpdateEnabled: autoUpdateEnabled.value,
-      runOnBoot: autostart.value
-    };
+    clearTimeout(saveTimeout);
+    saveTimeout = window.setTimeout(saveConfig, SAVE_DELAY_MS);
+  },
+  { deep: true }
+);
 
-    const payload = {
-      services: hiddenServices.value,
-      flags: payloadFlags,
-      active_hierarchy: activeHierarchy.value,
-      available_blocks: availableBlocks.value,
-      rename_behavior: renameBehavior.value,
-      duplicate_behavior: duplicateBehavior.value,
-      confidence_threshold: confidenceThreshold.value,
-      output_folder: outputFolder.value,
-      original_folder: originalFolder.value,
-      invalid_folder: invalidFolder.value,
-      downloads_folder: downloadsFolder.value,
-      blacklist: blacklist.value,
-    };
-    
-    try {
-      await invoke('save_config', { config: payload });
-    } catch (e) {
-      console.error("Failed to save config", e);
-    }
-}, { deep: true });
+// The view is unmounted when switching tabs - don't lose a change that's still waiting to be saved
+onBeforeUnmount(() => {
+  if (saveTimeout !== undefined) {
+    clearTimeout(saveTimeout);
+    saveConfig();
+  }
+});
 
 /**
  * Syncs the frontend Autostart checkbox with the actual Host OS startup registry.
@@ -502,9 +548,11 @@ const handleApplyModsChange = async (e: Event) => {
         </div>
       </div>
       <div class="path-input-row">
-        <input type="text" class="text-input" v-model="outputFolder" placeholder="/path/to/output" />
+        <input type="text" class="text-input" v-model.lazy="outputFolder" placeholder="/path/to/output"
+          :class="{ unsaved: isUnsaved('outputFolder') }" @input="trackDraft('outputFolder', $event)" />
         <button class="browse-btn" title="Browse" @click="pickOutputFolder">📁</button>
       </div>
+      <p v-if="isUnsaved('outputFolder')" class="unsaved-hint">Not saved yet. Press Enter or click elsewhere to save.</p>
 
       <div class="label-with-info">
         <label class="input-label">Original Artwork Folder</label>
@@ -513,7 +561,9 @@ const handleApplyModsChange = async (e: Event) => {
           <span class="tooltip">The folder name to use when the image is tagged as 'original' instead of a fandom.</span>
         </div>
       </div>
-      <input type="text" class="text-input" v-model="originalFolder" />
+      <input type="text" class="text-input" v-model.lazy="originalFolder"
+        :class="{ unsaved: isUnsaved('originalFolder') }" @input="trackDraft('originalFolder', $event)" />
+      <p v-if="isUnsaved('originalFolder')" class="unsaved-hint">Not saved yet. Press Enter or click elsewhere to save.</p>
       
       <div class="label-with-info">
         <label class="input-label">Invalid Match Folder</label>
@@ -522,7 +572,9 @@ const handleApplyModsChange = async (e: Event) => {
           <span class="tooltip">Where to dump images that don't meet the confidence threshold or encounter an error.</span>
         </div>
       </div>
-      <input type="text" class="text-input" v-model="invalidFolder" />
+      <input type="text" class="text-input" v-model.lazy="invalidFolder"
+        :class="{ unsaved: isUnsaved('invalidFolder') }" @input="trackDraft('invalidFolder', $event)" />
+      <p v-if="isUnsaved('invalidFolder')" class="unsaved-hint">Not saved yet. Press Enter or click elsewhere to save.</p>
 
       <div class="label-with-info">
         <label class="input-label">Batch Downloads Folder</label>
@@ -531,7 +583,9 @@ const handleApplyModsChange = async (e: Event) => {
           <span class="tooltip">Where to save bulk images downloaded via the Batch Downloader tab.</span>
         </div>
       </div>
-      <input type="text" class="text-input" v-model="downloadsFolder" />
+      <input type="text" class="text-input" v-model.lazy="downloadsFolder"
+        :class="{ unsaved: isUnsaved('downloadsFolder') }" @input="trackDraft('downloadsFolder', $event)" />
+      <p v-if="isUnsaved('downloadsFolder')" class="unsaved-hint">Not saved yet. Press Enter or click elsewhere to save.</p>
 
       <div class="label-with-info">
         <label class="input-label">Tag Blacklist (comma separated)</label>
@@ -540,7 +594,9 @@ const handleApplyModsChange = async (e: Event) => {
           <span class="tooltip">Tags to completely ignore when searching for Character, Fandom, or Artist names.</span>
         </div>
       </div>
-      <input type="text" class="text-input" v-model="blacklist" placeholder="comic, sketch..." />
+      <input type="text" class="text-input" v-model.lazy="blacklist" placeholder="comic, sketch..."
+        :class="{ unsaved: isUnsaved('blacklist') }" @input="trackDraft('blacklist', $event)" />
+      <p v-if="isUnsaved('blacklist')" class="unsaved-hint">Not saved yet. Press Enter or click elsewhere to save.</p>
     </div>
 
     <div class="about-footer unselectable">
@@ -629,6 +685,10 @@ h4 { color: var(--text-primary); margin-bottom: 12px; font-weight: 800; font-siz
 
 .text-input { width: 100%; padding: 10px 12px; background-color: var(--bg-base); border: 1px solid var(--bg-surface-elevated); color: var(--text-primary); border-radius: 6px; box-sizing: border-box; font-family: 'Nunito', sans-serif; transition: border-color 0.2s; }
 .text-input:focus { outline: none; border-color: var(--accent-primary); }
+
+/* Text fields with edits that haven't been committed (saved) yet - stays visible while typing */
+.text-input.unsaved, .text-input.unsaved:focus { border-color: #f5c542; }
+.unsaved-hint { margin: 4px 0 0; font-size: 0.75rem; color: #f5c542; }
 .danger-option { color: #ff4d4d; font-weight: 800; }
 
 /* Drag and Drop */

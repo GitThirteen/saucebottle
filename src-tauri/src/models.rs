@@ -84,8 +84,6 @@ impl Default for AppConfig {
         flags.insert("listDupes".to_string(), true);
         flags.insert("allowImageConversion".to_string(), true);
         flags.insert("allowShrinking".to_string(), true);
-        flags.insert("renameFoundImages".to_string(), true);
-        flags.insert("renameInvalidImages".to_string(), true);
         flags.insert("isPermanentScan".to_string(), true);
         flags.insert("allowResizing".to_string(), true);
         flags.insert("autoUpdateEnabled".to_string(), true);
@@ -129,6 +127,8 @@ pub struct BooruResponse {
     pub service: String,
     pub similarity: u8,
     pub file_path: String,
+    /// True if the work has no known fandom and was filed under the "original artwork" folder.
+    pub is_original_work: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

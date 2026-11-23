@@ -53,10 +53,9 @@ import {
   appState,
   updateProgress,
   updateStatus,
-  queueCount,
-  offlineQueueCount
+  queueCount
 } from './store';
-import { unreadCount, setLogTabOpen } from './logger';
+import { logger, unreadCount, setLogTabOpen } from './logger';
 import './assets/main.css';
 
 // ---------------------------------*
@@ -103,12 +102,30 @@ const setTab = (tab: string) => {
 };
 
 /**
+ * Stops the background scanning daemon (used to end a manual-mode run).
+ */
+const stopScanning = async () => {
+  isProcessing.value = false;
+  try {
+    await invoke('set_scan_state', { active: false });
+  } catch (e) {
+    console.error("Failed to terminate scan state:", e);
+  }
+};
+
+/**
  * Toggles the background scanning daemon on and off.
  */
 const toggleProcessing = async () => {
   isProcessing.value = !isProcessing.value;
   try {
-    await invoke('set_scan_state', { active: isProcessing.value });
+    const queued: number = await invoke('set_scan_state', { active: isProcessing.value });
+
+    // Manual mode: a run with nothing to do ends right away instead of silently listening
+    if (isProcessing.value && !isPermanentScan.value && queued === 0 && queueCount.value === 0) {
+      logger.info('Nothing to process in the input folder.');
+      await stopScanning();
+    }
   } catch (e) {
     console.error("Failed to sync state with Rust:", e);
   }
@@ -147,7 +164,8 @@ const runBootSequence = async () => {
 
   try {
     const [update, _] = await Promise.all([
-      check().catch((e) => {
+      // Without a timeout, this can hang forever right after boot when the network isn't fully up yet
+      check({ timeout: 15000 }).catch((e) => {
         console.error("Update check failed (offline or rate limited):", e);
         return null; // Return null gracefully if the user, e.g., has no internet
       }),
@@ -192,7 +210,7 @@ const runBootSequence = async () => {
     console.error("Critical error during boot sequence:", error);
   }
 
-  appState.value = 'welcome';
+  if (appState.value === 'updating') appState.value = 'welcome';
 };
 
 // ---------------------------------*
@@ -220,8 +238,10 @@ onMounted(async () => {
     console.warn("Could not load config on boot");
   }
 
-  // 3. Check for updates
-  await runBootSequence();
+  // 3. Check for updates. Not awaited: processing must not wait on the update check, which can take
+  //    long (or wait on a dialog hidden behind a minimized window). It switches to the 'updating'
+  //    screen synchronously, and the UI loop holds back processing screens until it's done.
+  const bootSequence = runBootSequence();
 
   // 4. Bind Tauri Events
   await initTauriListeners();
@@ -244,8 +264,8 @@ onMounted(async () => {
         isDragging.value = false;
         if (event.payload.paths && event.payload.paths.length > 0) {
           try {
-            const resultMessage = await invoke('process_dropped_files', { paths: event.payload.paths });
-            console.log(resultMessage);
+            const resultMessage: string = await invoke('process_dropped_files', { paths: event.payload.paths });
+            logger.info(resultMessage);
             await syncOfflineQueue();
             if (!isProcessing.value) appState.value = 'welcome';
           } catch (errorMessage) {
@@ -257,22 +277,21 @@ onMounted(async () => {
   } catch (e) {
     console.warn("Could not bind drag and drop listener", e);
   }
+
+  await bootSequence;
 });
 
 onUnmounted(() => {
   unlistenDragDrop?.();
 });
 
-watch(() => appState.value, async (newState) => {
-  if (!isPermanentScan.value && isProcessing.value && newState === 'welcome') {
-    if (queueCount.value === 0 && offlineQueueCount.value === 0) {
-      isProcessing.value = false;
-      try {
-        await invoke('set_scan_state', { active: false });
-      } catch (e) {
-        console.error("Failed to terminate scan state:", e);
-      }
-    }
+// Manual mode: end the run once the queue has been worked off. This deliberately keys off the
+// queue rather than the screen state - after a successful image the UI stays on the result
+// screen and never returns to 'welcome', so a screen-based check never fired after successes.
+// Also covers switching to manual mode in Settings while idle.
+watch([queueCount, isPermanentScan], async ([count, permanent]) => {
+  if (!permanent && isProcessing.value && count === 0) {
+    await stopScanning();
   }
 });
 
@@ -324,7 +343,10 @@ watch([queueCount, isProcessing], ([newQueue, newProcessing]) => {
       <KeepAlive>
         <MainView v-if="currentTab === 'main'" />
       </KeepAlive>
-      <DownloadView v-if="currentTab === 'download'" />
+      <!-- Kept alive so a running batch download keeps its state (and Abort button) across tab switches -->
+      <KeepAlive>
+        <DownloadView v-if="currentTab === 'download'" />
+      </KeepAlive>
       <LogsView v-if="currentTab === 'logs'" />
       <CredentialsView v-if="currentTab === 'keys'" />
       <SettingsView v-if="currentTab === 'settings'" />

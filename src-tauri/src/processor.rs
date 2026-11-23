@@ -31,7 +31,19 @@ use crate::models::{AppConfig, BooruResponse, ImageInfo};
 // 8MB IQDB limit
 const MAX_FILE_SIZE: u64 = 8 * 1024 * 1024;
 
+/// Device names Windows reserves - a file or folder with one of these names can't be created,
+/// not even with an extension (`CON.txt`), regardless of case.
+const RESERVED_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
 /// Strips illegal characters from a string so it can be safely used as a folder or file name.
+/// Also takes care of names Windows refuses or silently alters: reserved device names
+/// (a character tagged "Con" would otherwise fail to sort), trailing dots and spaces
+/// (Windows drops them, so "Dr." and "Dr" would end up as the same folder), and names that
+/// end up empty.
 ///
 /// # Arguments
 /// * `name` - The raw string to sanitize.
@@ -39,10 +51,27 @@ const MAX_FILE_SIZE: u64 = 8 * 1024 * 1024;
 /// # Returns
 /// * `String` - The safe, cleaned string.
 fn sanitize_filename(name: &str) -> String {
-    name.replace(|c: char| "/\\?%*:|\"<>".contains(c), "")
-        .replace("  ", " ")
-        .trim()
-        .to_string()
+    // Collapse whitespace runs first (so tabs/line breaks become a single space instead of
+    // vanishing), then strip the remaining control and illegal characters
+    let collapsed = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cleaned: String = collapsed
+        .chars()
+        .filter(|c| !c.is_control() && !"/\\?%*:|\"<>".contains(*c))
+        .collect();
+
+    // Drop the trailing dots/spaces Windows would strip anyway
+    let trimmed = cleaned.trim_end_matches(['.', ' ']);
+
+    if trimmed.is_empty() {
+        return "Unknown".to_string();
+    }
+
+    let base_name = trimmed.split('.').next().unwrap_or("").trim_end().to_uppercase();
+    if RESERVED_NAMES.contains(&base_name.as_str()) {
+        return format!("{}_", trimmed);
+    }
+
+    trimmed.to_string()
 }
 
 /// Simple helper for assembling the final file location, including correct duplication handling.
@@ -250,22 +279,64 @@ pub fn get_iqdb_payload(
     }
 }
 
+/// Returns `true` if a rename failed only because source and destination are on different drives.
+fn is_cross_device(error: &std::io::Error) -> bool {
+    const ERROR_NOT_SAME_DEVICE: i32 = 17; // Windows
+    const EXDEV: i32 = 18; // Unix
+
+    error.kind() == std::io::ErrorKind::CrossesDevices
+        || error.raw_os_error() == Some(if cfg!(windows) { ERROR_NOT_SAME_DEVICE } else { EXDEV })
+}
+
+/// Moves a file, never leaving a partial or duplicate copy behind.
 /// Standard `fs::rename` fails if the source and destination are on different disk partitions/drives.
-/// This attempts the fast rename first, and gracefully falls back to a full copy + delete if required.
+/// Only in that case do we fall back to copy + delete; any other rename failure (e.g. the file is
+/// still open in another program) is reported as-is instead of copying a possibly incomplete file.
 ///
 /// # Arguments
 /// * `from` - Current file path.
 /// * `to` - Target file path.
 ///
 /// # Returns
-/// * `Result<(), String>` - Success, or a detailed error if both methods fail.
-fn atomic_move(from: &Path, to: &Path) -> Result<(), String> {
-    if fs::rename(from, to).is_ok() {
-        return Ok(());
+/// * `Result<(), String>` - Success, or a detailed error. On error, the source file is left untouched.
+pub fn atomic_move(from: &Path, to: &Path) -> Result<(), String> {
+    let rename_error = match fs::rename(from, to) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+
+    if !is_cross_device(&rename_error) {
+        return Err(format!("Move failed: {}", rename_error));
     }
 
-    fs::copy(from, to).map_err(|e| format!("Copy failed: {}", e))?;
-    fs::remove_file(from).map_err(|e| format!("Cleanup failed: {}", e))?;
+    // Copy under a temporary name first, so a half-copied file never shows up under the real name
+    let file_name = to.file_name().unwrap_or_default().to_string_lossy();
+    let temp_path = to.with_file_name(format!(".{}.sbpart", file_name));
+
+    let copy_result = fs::copy(from, &temp_path).and_then(|copied| {
+        let source_len = fs::metadata(from)?.len();
+        if copied == source_len {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("source file changed while it was being copied"))
+        }
+    });
+    if let Err(e) = copy_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("Copy failed: {}", e));
+    }
+
+    if let Err(e) = fs::rename(&temp_path, to) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("Copy failed: {}", e));
+    }
+
+    // Only remove the original once the copy is in place; if that fails, undo the copy instead
+    if let Err(e) = fs::remove_file(from) {
+        let _ = fs::remove_file(to);
+        return Err(format!("Could not remove original after copying: {}", e));
+    }
+
     Ok(())
 }
 
@@ -338,7 +409,10 @@ pub fn move_to_results(
 
         match config.duplicate_behavior.as_str() {
             "delete" => {
-                let _ = fs::remove_file(source_path);
+                // If this fails the file stays in the input folder, so report it instead of
+                // claiming success (it would otherwise be picked up again by every sweep)
+                fs::remove_file(source_path)
+                    .map_err(|e| format!("Could not delete duplicate: {}", e))?;
                 return Ok(dest_path);
             }
             "move_folder_deep" => {
@@ -370,7 +444,13 @@ pub fn move_to_results(
         // Write modified buffer directly to new destination & delete original
         fs::write(&dest_path, payload)
             .map_err(|e| format!("Failed to write modified file: {}", e))?;
-        let _ = fs::remove_file(source_path);
+
+        // If the original can't be removed it stays in the input folder and would be sorted again,
+        // so undo the write rather than leaving a duplicate behind
+        if let Err(e) = fs::remove_file(source_path) {
+            let _ = fs::remove_file(&dest_path);
+            return Err(format!("Could not remove original after saving modified copy: {}", e));
+        }
     } else {
         // Perform a regular move
         atomic_move(source_path, &dest_path)?;

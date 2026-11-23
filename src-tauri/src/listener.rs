@@ -15,11 +15,12 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc::Sender, mpsc::channel};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
+use notify::event::{EventKind, ModifyKind, RenameMode};
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -34,51 +35,99 @@ use crate::processor;
 // Certain println! should either be logged to the frontend or deleted, but right now some messages do get logged while others are internal-only.
 // This is messy and needs a thorough clean-up.
 
-/// Asynchronously waits for a file to finish writing to disk by polling for exclusive write access.
-/// Uses an exponential backoff strategy, starting at 10ms for small files, increasing the interval
-/// by x1.5 to prevent CPU pegging on larger files or slow drives.
-/// 
+/// How long a file's size and modification time must stay unchanged before we trust that it's complete.
+const SETTLE_TIME: Duration = Duration::from_millis(300);
+/// Empty files are often placeholders that get filled a moment later (e.g. by browsers), so they get longer.
+const EMPTY_SETTLE_TIME: Duration = Duration::from_secs(10);
+/// A non-empty file that hasn't been written to for this long is considered settled without waiting.
+const STALE_AGE: Duration = Duration::from_secs(5);
+/// Give up if the file stays locked or keeps changing without settling for this long.
+const STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Safety-net interval for re-sweeping the input folder, catching anything the OS watcher missed.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Extensions of in-progress downloads/transfers. These files get renamed once they're done,
+/// so we ignore them and pick up the final file instead.
+const TEMP_EXTENSIONS: [&str; 7] = ["part", "crdownload", "tmp", "partial", "download", "opdownload", "!ut"];
+
+/// Returns `true` if the path looks like an unfinished download/transfer.
+fn is_temp_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| TEMP_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+}
+
+/// Outcome of waiting for a file to be fully written.
+enum FileState {
+    /// The file is complete and nobody else has it open.
+    Ready,
+    /// The file disappeared in the meantime (already moved/renamed by someone else).
+    Gone,
+}
+
+/// Tries to open the file in a way that fails while *any* other process still has it open.
+/// Unlike opening for writing, this can't be fooled by writers that allow shared write access
+/// (C `fopen`, .NET, most image editors and save dialogs).
+#[cfg(windows)]
+fn is_unlocked(path: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new().read(true).share_mode(0).open(path).is_ok()
+}
+
+/// Other OSes have no mandatory locking, so we rely on the size/mtime settle check alone.
+#[cfg(not(windows))]
+fn is_unlocked(path: &Path) -> bool {
+    std::fs::File::open(path).is_ok()
+}
+
+/// Asynchronously waits for a file to finish writing to disk.
+/// A file counts as ready once its size and modification time have stopped changing
+/// *and* no other process has it open anymore. Polls with an exponential backoff
+/// (10ms, x1.5, capped at 150ms) to stay cheap on large files or slow drives.
+///
 /// # Arguments
 /// * `path` - The file path of the file we want to read.
-async fn wait_for_file_ready(path: &PathBuf) -> Result<(), &'static str> {
-    let start_time = std::time::Instant::now();
-
+async fn wait_for_file_ready(path: &Path) -> Result<FileState, &'static str> {
     let mut current_delay = Duration::from_millis(10);
     let max_delay = Duration::from_millis(150);
-    let timeout = Duration::from_secs(10);
+
+    let mut last_seen: Option<(u64, Option<SystemTime>)> = None;
+    let mut unchanged_since = Instant::now();
 
     loop {
-        match std::fs::OpenOptions::new().append(true).open(path) {
-            Ok(_) => {
-                return Ok(());
-            }
-            Err(error) => {
-                // Cloud transfers often flag files as Read-Only.
-                // If it's read-only, append(true) will always fail.
-                if error.kind() == std::io::ErrorKind::PermissionDenied {
-                    if let Ok(metadata) = std::fs::metadata(path) {
-                        if metadata.permissions().readonly() {
-                            // Ensure we can at least read it before giving the green light
-                            if std::fs::OpenOptions::new().read(true).open(path).is_ok() {
-                                return Ok(());
-                            }
-                        }
-                    }
+        match std::fs::metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FileState::Gone),
+            Err(_) => {} // Transient (e.g. locked by a cloud sync client), just try again
+            Ok(meta) => {
+                let len = meta.len();
+                let modified = meta.modified().ok();
+
+                if last_seen != Some((len, modified)) {
+                    last_seen = Some((len, modified));
+                    unchanged_since = Instant::now();
                 }
 
-                if start_time.elapsed() > timeout {
-                    return Err("Timed out waiting for file to finish writing to disk.");
+                let settle_time = if len == 0 { EMPTY_SETTLE_TIME } else { SETTLE_TIME };
+                let untouched_for = modified
+                    .and_then(|m| SystemTime::now().duration_since(m).ok())
+                    .unwrap_or_default();
+                let settled = unchanged_since.elapsed() >= settle_time
+                    || (len > 0 && untouched_for >= STALE_AGE);
+
+                if settled && is_unlocked(path) {
+                    return Ok(FileState::Ready);
                 }
-
-                tokio::time::sleep(current_delay).await;
-
-                // Increase the delay by x1.5 for the next loop, capping at max_delay
-                current_delay = std::cmp::min(
-                    current_delay.mul_f32(1.5), 
-                    max_delay
-                );
             }
         }
+
+        if unchanged_since.elapsed() > STALL_TIMEOUT {
+            return Err("Timed out waiting for file to finish writing to disk.");
+        }
+
+        tokio::time::sleep(current_delay).await;
+
+        // Increase the delay by x1.5 for the next loop, capping at max_delay
+        current_delay = std::cmp::min(current_delay.mul_f32(1.5), max_delay);
     }
 }
 
@@ -90,18 +139,24 @@ async fn wait_for_file_ready(path: &PathBuf) -> Result<(), &'static str> {
 /// * `path` - The exact file path of the image being processed.
 /// * `client` - Thread-safe reference to the API client for making HTTP requests.
 /// * `handle` - The Tauri AppHandle used to emit progress events to the frontend.
-/// * `is_new_drop` - True if the file was *just* created by the OS. Applies a brief delay
-///                   to ensure the OS has finished writing the file before we try to read it. (This is actually not very good, see [WARN]!)
 /// * `queued_tracker` - Thread-safe set of currently processing file paths to prevent duplicates.
 async fn process_single_file(
     path: PathBuf,
     client: Arc<ApiClient>,
     handle: AppHandle,
-    is_new_drop: bool,
     queued_tracker: Arc<Mutex<HashSet<PathBuf>>>,
 ) {
-    if is_new_drop {
-        if let Err(e) = wait_for_file_ready(&path).await {
+    // Every file goes through this, including ones found by a sweep: a sweep can just as well
+    // run while a file is still being copied into the input folder.
+    match wait_for_file_ready(&path).await {
+        Ok(FileState::Ready) => {}
+        Ok(FileState::Gone) => {
+            // Already moved away (e.g. a duplicate event for a file we just sorted) - nothing to do
+            queued_tracker.lock().unwrap().remove(&path);
+            let _ = handle.emit("task-done", ());
+            return;
+        }
+        Err(e) => {
             queued_tracker.lock().unwrap().remove(&path);
             let _ = handle.emit("failure", format!("File read error on {:?}: {}", path.file_name().unwrap_or_default(), e));
             let _ = handle.emit("task-done", ());
@@ -109,18 +164,8 @@ async fn process_single_file(
         }
     }
 
+    // Never empty: Yande.re needs no credentials and is always available
     let active_services = client.get_active_credentials();
-    if active_services.is_empty() {
-        queued_tracker.lock().unwrap().remove(&path);
-
-        let _ = handle.emit(
-            "failure",
-            "No active API credentials configured. Please add keys in the Credentials tab."
-                .to_string(),
-        );
-        let _ = handle.emit("task-done", ());
-        return;
-    }
 
     let config_snapshot = client.config();
 
@@ -150,9 +195,11 @@ async fn process_single_file(
             .to_lowercase();
         let detected = info.format.to_lowercase();
 
+        // Extensions that are just alternative names for the detected format
         let is_mismatch = match ext.as_str() {
-            "jpg" | "jpeg" => detected != "jpeg",
+            "jpg" | "jpeg" | "jpe" | "jfif" => detected != "jpeg",
             "tif" | "tiff" => detected != "tiff",
+            "heic" | "heif" => detected != "heic",
             "" => false,
             _ => ext != detected,
         };
@@ -254,32 +301,40 @@ async fn process_single_file(
 /// * `handle` - The Tauri AppHandle for resolving directory paths.
 /// * `tx` - The transmit channel to send found files to the processor queue.
 /// * `queued_tracker` - Thread-safe set to prevent re-queuing files already in progress.
+///
+/// # Returns
+/// * `usize` - The number of files newly added to the queue (files already queued aren't counted).
 pub fn run_sweep(
     handle: &AppHandle,
-    tx: &Sender<(PathBuf, bool)>,
+    tx: &Sender<PathBuf>,
     queued_tracker: &Arc<Mutex<HashSet<PathBuf>>>,
-) {
+) -> usize {
     // [TODO] This is defined twice, mild bug hazard
     let app_dir = handle.path().picture_dir().expect("Path resolution failed");
     let watch_path = app_dir.join("SauceBottle").join("input");
+    let mut queued = 0;
 
     println!("Sweeping folder for unprocessed files...");
     if let Ok(entries) = std::fs::read_dir(watch_path) {
         let mut tracker = queued_tracker.lock().unwrap();
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file() && tracker.insert(path.clone()) {
+            if path.is_file() && !is_temp_file(&path) && tracker.insert(path.clone()) {
                 let _ = handle.emit("queue-add", ());
-                let _ = tx.send((path, false)); // already on disk - no write-delay needed
+                let _ = tx.send(path);
+                queued += 1;
             }
         }
     }
+
+    queued
 }
 
 /// Initializes the core background daemon for SauceBottle.
-/// Spawns two independent threads:
+/// Spawns three independent threads:
 /// 1. An async worker thread that drains the processing channel queue one by one.
-/// 2. An OS file-system watcher thread that listens for new files being created in the input directory.
+/// 2. An OS file-system watcher thread that listens for new files appearing in the input directory.
+/// 3. A heartbeat thread that periodically sweeps the input directory as a safety net for missed watcher events.
 ///
 /// # Arguments
 /// * `handle` - The Tauri AppHandle.
@@ -287,15 +342,15 @@ pub fn run_sweep(
 /// * `is_scanning` - Atomic flag controlling whether the app should process or ignore files (Pause/Resume feature).
 ///
 /// # Returns
-/// * `(Sender<(PathBuf, bool)>, Arc<Mutex<HashSet<PathBuf>>>)` - Returns the channel transmitter so external commands
+/// * `(Sender<PathBuf>, Arc<Mutex<HashSet<PathBuf>>>)` - Returns the channel transmitter so external commands
 ///                                                              (like `run_sweep`) can feed files into the queue,
 ///                                                              along with the active queue tracker.
 pub fn spawn_watcher(
     handle: AppHandle,
     api_client: Arc<ApiClient>,
     is_scanning: Arc<AtomicBool>,
-) -> (Sender<(PathBuf, bool)>, Arc<Mutex<HashSet<PathBuf>>>) {
-    let (proc_tx, proc_rx) = channel::<(PathBuf, bool)>();
+) -> (Sender<PathBuf>, Arc<Mutex<HashSet<PathBuf>>>) {
+    let (proc_tx, proc_rx) = channel::<PathBuf>();
     let queued_tracker = Arc::new(Mutex::new(HashSet::new()));
 
     let processor_handle = handle.clone();
@@ -305,7 +360,7 @@ pub fn spawn_watcher(
     // Thread 1: Worker/Processor
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        for (path, is_new_drop) in proc_rx {
+        for path in proc_rx {
             if !processor_scanning.load(Ordering::Relaxed) {
                 let is_permanent = api_client.config().flags.get("isPermanentScan").copied().unwrap_or(true);
 
@@ -325,7 +380,6 @@ pub fn spawn_watcher(
                     path,
                     api_client.clone(),
                     processor_handle.clone(),
-                    is_new_drop,
                     worker_tracker.clone(),
                 )
                 .await;
@@ -335,9 +389,12 @@ pub fn spawn_watcher(
 
     let watch_tx_clone = proc_tx.clone();
     let observer_tracker = queued_tracker.clone();
+    let observer_scanning = is_scanning.clone();
+    let observer_handle = handle.clone();
 
     // Thread 2: OS File-System Observer
     std::thread::spawn(move || {
+        let handle = observer_handle;
         let app_data_dir = handle
             .path()
             .picture_dir()
@@ -354,17 +411,30 @@ pub fn spawn_watcher(
 
         for res in rx {
             let Ok(event) = res else { continue }; // Skip if invalid event
-            
-            if !event.kind.is_create() { // Skip if not a file creation event
+
+            if !observer_scanning.load(Ordering::Relaxed) { // Skip if scanning is turned off
+                continue;
+            }
+
+            // The OS dropped events (e.g. buffer overflow) - we can't know what we missed, so sweep
+            if event.need_rescan() {
+                run_sweep(&handle, &watch_tx_clone, &observer_tracker);
+                continue;
+            }
+
+            // Files can appear either by being created, or by being moved/renamed into the folder
+            // (Explorer moves on the same drive, browsers renaming finished downloads, ...)
+            let is_arrival = match event.kind {
+                EventKind::Create(_) => true,
+                EventKind::Modify(ModifyKind::Name(mode)) => mode != RenameMode::From,
+                _ => false,
+            };
+            if !is_arrival {
                 continue;
             }
 
             for path in event.paths {
-                if !path.is_file() { // Skip if not a file
-                    continue;
-                }
-
-                if !is_scanning.load(Ordering::Relaxed) { // Skip if scanning is turned off
+                if !path.is_file() || is_temp_file(&path) { // Skip folders, vanished paths and unfinished downloads
                     continue;
                 }
 
@@ -374,7 +444,20 @@ pub fn spawn_watcher(
 
                 println!("Detected new drop: {:?}", path);
                 let _ = handle.emit("queue-add", ());
-                let _ = watch_tx_clone.send((path, true));
+                let _ = watch_tx_clone.send(path);
+            }
+        }
+    });
+
+    let heartbeat_tx = proc_tx.clone();
+    let heartbeat_tracker = queued_tracker.clone();
+
+    // Thread 3: Heartbeat sweep
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(HEARTBEAT_INTERVAL);
+            if is_scanning.load(Ordering::Relaxed) {
+                run_sweep(&handle, &heartbeat_tx, &heartbeat_tracker);
             }
         }
     });

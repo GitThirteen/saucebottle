@@ -15,6 +15,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 mod api;
+mod config;
 mod listener;
 mod models;
 mod processor;
@@ -26,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use keyring_core::Entry;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -44,9 +45,11 @@ const MAX_FILES: usize = 5000;
 
 struct AppState {
     is_active: Arc<AtomicBool>,
-    queue_tx: std::sync::mpsc::Sender<(PathBuf, bool)>,
+    queue_tx: std::sync::mpsc::Sender<PathBuf>,
     queued_tracker: Arc<Mutex<HashSet<PathBuf>>>,
     config: Arc<Mutex<Arc<AppConfig>>>,
+    /// Problems found while loading the config, shown in the Logs tab once the UI is listening.
+    startup_warnings: Mutex<Vec<String>>,
 }
 
 #[derive(serde::Serialize)]
@@ -57,24 +60,26 @@ struct DLImage {
 }
 
 /// Updates the background scanning state of the application.
-/// If toggled to `true`, it immediately triggers a sweep of the input folder.
+/// If toggled to `true`, it immediately sweeps the input folder.
 ///
 /// # Arguments
 /// * `active` - Whether the background listener should be active.
 /// * `state` - The managed Tauri application state containing the processing queues.
-/// * `handle` - The Tauri AppHandle used to spawn the listener thread.
+/// * `handle` - The Tauri AppHandle used for emitting queue events.
+///
+/// # Returns
+/// * `usize` - How many files the sweep newly queued (0 if nothing was swept). The sweep only
+///             lists the folder, so it runs synchronously and the frontend can rely on the count.
 #[tauri::command]
-fn set_scan_state(active: bool, state: tauri::State<'_, AppState>, handle: tauri::AppHandle) {
+fn set_scan_state(active: bool, state: tauri::State<'_, AppState>, handle: tauri::AppHandle) -> usize {
     let was_active = state.is_active.swap(active, Ordering::Relaxed);
     println!("Scan state set to: {}", active);
 
     if active && !was_active {
-        let tx = state.queue_tx.clone();
-        let tracker = state.queued_tracker.clone();
-        std::thread::spawn(move || {
-            listener::run_sweep(&handle, &tx, &tracker);
-        });
+        return listener::run_sweep(&handle, &state.queue_tx, &state.queued_tracker);
     }
+
+    0
 }
 
 /// Retrieves the current application configuration from memory.
@@ -107,14 +112,11 @@ fn save_config(
     use tauri::Manager;
     use tauri_plugin_autostart::ManagerExt;
     
-    let data = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
-    
     // Using the secure App Config Directory
     let config_dir = handle.path().app_config_dir().map_err(|e| e.to_string())?;
     fs::create_dir_all(&config_dir).map_err(|e| e.to_string())?;
-    
-    let config_path = config_dir.join("config.json");
-    fs::write(config_path, data).map_err(|e| e.to_string())?;
+
+    config::save(&config_dir.join("config.json"), &config)?;
 
     let run_on_boot = config.flags.get("runOnBoot").copied().unwrap_or(false);
     let autolaunch = handle.autolaunch();
@@ -139,6 +141,10 @@ fn save_config(
 #[tauri::command]
 fn frontend_ready(state: tauri::State<'_, AppState>, handle: tauri::AppHandle) {
     println!("Frontend is ready!");
+
+    for warning in state.startup_warnings.lock().unwrap().drain(..) {
+        let _ = handle.emit("warn", warning);
+    }
 
     if state.is_active.load(Ordering::Relaxed) {
         let tx = state.queue_tx.clone();
@@ -232,6 +238,22 @@ fn delete_credential(service: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// SauceBottle's own folders, which a drop must not blindly import from (canonicalized paths).
+struct OwnFolders {
+    /// The input folder. Importing from it into itself would feed on its own copies.
+    input: Option<PathBuf>,
+    /// The results folder. Reached as a *subfolder* of a drop (e.g. dropping "SauceBottle" or
+    /// "Pictures"), it would re-import the whole sorted library.
+    results: Option<PathBuf>,
+}
+
+/// Running totals of a drag-and-drop import.
+#[derive(Default)]
+struct ImportStats {
+    imported: usize,
+    skipped_own_folders: bool,
+}
+
 /// Recursively traverses a dragged-and-dropped directory, pulling all valid images
 /// out of subfolders and placing them directly into the target input directory.
 /// Renames files automatically to avoid collisions.
@@ -240,7 +262,8 @@ fn delete_credential(service: &str) -> Result<(), String> {
 /// * `path` - The current file or folder path being inspected.
 /// * `target_dir` - The destination directory where files should be moved.
 /// * `depth` - The current recursion depth (to countermeasure faulty inputs).
-/// * `copied_count` - A mutable tracker for the number of files successfully processed.
+/// * `own_folders` - SauceBottle's own folders, which are skipped (see [`OwnFolders`]).
+/// * `stats` - Running totals: files imported, and whether any of our own folders were skipped.
 ///
 /// # Returns
 /// * `Result<(), String>` - Success, or an error if safety limits are breached.
@@ -248,7 +271,8 @@ fn import_to_input_recursive(
     path: &Path,
     target_dir: &Path,
     depth: usize,
-    copied_count: &mut usize,
+    own_folders: &OwnFolders,
+    stats: &mut ImportStats,
 ) -> Result<(), String> {
     if depth > MAX_DEPTH {
         return Err(format!(
@@ -257,11 +281,25 @@ fn import_to_input_recursive(
         ));
     }
 
-    if *copied_count >= MAX_FILES {
+    if stats.imported >= MAX_FILES {
         return Err(format!(
             "Safety limit reached: Cannot import more than {} files at once.",
             MAX_FILES
         ));
+    }
+
+    // Files below depth 0 sit inside an already-checked folder, so only folders and the
+    // dropped items themselves need the (comparatively slow) canonicalization
+    if (depth == 0 || path.is_dir())
+        && let Ok(canonical) = fs::canonicalize(path)
+    {
+        let in_input = own_folders.input.as_ref().is_some_and(|input| canonical.starts_with(input));
+        let is_nested_results = depth > 0 && own_folders.results.as_ref() == Some(&canonical);
+
+        if in_input || is_nested_results {
+            stats.skipped_own_folders = true;
+            return Ok(());
+        }
     }
 
     if path.is_file() {
@@ -287,17 +325,16 @@ fn import_to_input_recursive(
                 dest = target_dir.join(format!("{}_import{}.{}", file_stem, counter, extension));
             }
 
+            // Dropped files are moved (without ever leaving a half-copied duplicate behind),
+            // files inside dropped folders are copied
             let moved = if depth == 0 {
-                match fs::rename(path, &dest) {
-                    Ok(_) => true,
-                    Err(_) => fs::copy(path, &dest).is_ok() && fs::remove_file(path).is_ok(),
-                }
+                processor::atomic_move(path, &dest).is_ok()
             } else {
                 fs::copy(path, &dest).is_ok()
             };
 
             if moved {
-                *copied_count += 1;
+                stats.imported += 1;
             }
         }
     } else if path.is_dir() {
@@ -307,7 +344,7 @@ fn import_to_input_recursive(
 
         if let Ok(entries) = fs::read_dir(path) {
             for entry in entries.flatten() {
-                import_to_input_recursive(&entry.path(), target_dir, depth + 1, copied_count)?;
+                import_to_input_recursive(&entry.path(), target_dir, depth + 1, own_folders, stats)?;
             }
         }
     }
@@ -318,25 +355,46 @@ fn import_to_input_recursive(
 ///
 /// # Arguments
 /// * `paths` - A list of absolute file paths dropped by the user.
+/// * `state` - The managed Tauri application state (for the configured results folder).
 /// * `handle` - The Tauri AppHandle for path resolution.
 ///
 /// # Returns
 /// * `Result<String, String>` - A success message with the file count, or an error.
 #[tauri::command]
-fn process_dropped_files(paths: Vec<String>, handle: tauri::AppHandle) -> Result<String, String> {
+fn process_dropped_files(
+    paths: Vec<String>,
+    state: tauri::State<'_, AppState>,
+    handle: tauri::AppHandle,
+) -> Result<String, String> {
     let docs_dir = handle.path().picture_dir().expect("Path resolution failed");
     let saucebottle_dir = docs_dir.join("SauceBottle");
     let input_dir = saucebottle_dir.join("input");
 
     fs::create_dir_all(&input_dir).map_err(|e| e.to_string())?;
 
-    let mut copied_count = 0;
+    let config = state.config.lock().unwrap().clone();
+    let results_dir = if config.output_folder.trim().is_empty() {
+        saucebottle_dir.join("results")
+    } else {
+        PathBuf::from(&config.output_folder)
+    };
 
+    // A folder that doesn't exist can't contain anything to skip, so `None` is fine there
+    let own_folders = OwnFolders {
+        input: fs::canonicalize(&input_dir).ok(),
+        results: fs::canonicalize(&results_dir).ok(),
+    };
+
+    let mut stats = ImportStats::default();
     for p in paths {
-        import_to_input_recursive(Path::new(&p), &input_dir, 0, &mut copied_count)?;
+        import_to_input_recursive(Path::new(&p), &input_dir, 0, &own_folders, &mut stats)?;
     }
 
-    Ok(format!("Successfully queued {} images.", copied_count))
+    let mut message = format!("Successfully queued {} images.", stats.imported);
+    if stats.skipped_own_folders {
+        message.push_str(" SauceBottle's own input/results folders were skipped.");
+    }
+    Ok(message)
 }
 
 /// Checks the `input` directory and returns the total count of valid image files waiting to be processed.
@@ -389,25 +447,35 @@ async fn fetch_booru_page(
         api_key = parsed["apiKey"].as_str().unwrap_or("").to_string();
     }
 
-    // Correctly format tags (e.g. "blue archive, official art" -> "blue_archive+official_art")
+    // Correctly format tags (e.g. "blue archive, official art" -> "blue_archive+official_art").
+    // Each tag is URL-encoded on its own, so characters like '&', '#' or '+' inside a tag can't
+    // break the query - only the '+' separators between tags stay as they are.
     let formatted_tags = tags
         .split(',')
         .map(|s| s.trim().replace(" ", "_"))
         .filter(|s| !s.is_empty())
+        .map(|s| api::url_encode(&s))
         .collect::<Vec<_>>()
         .join("+");
+
+    // Credentials go into the query string too, so they need the same treatment
+    let encoded_username = api::url_encode(&username);
+    let encoded_api_key = api::url_encode(&api_key);
+
+    // Pages are 1-based; a 0 would underflow Gelbooru's 0-based `pid` below
+    let page = page.max(1);
 
     // URL magic
     let url = match service.as_str() {
         "Danbooru" => format!(
             "https://danbooru.donmai.us/posts.json?tags={}&login={}&api_key={}&page={}",
-            formatted_tags, username, api_key, page
+            formatted_tags, encoded_username, encoded_api_key, page
         ),
         "Gelbooru" => format!(
             "https://gelbooru.com/index.php?page=dapi&s=post&q=index&tags={}&user_id={}&api_key={}&pid={}&json=1&limit=42",
             formatted_tags,
-            username,
-            api_key,
+            encoded_username,
+            encoded_api_key,
             page - 1
         ),
         "Yande.re" => format!(
@@ -423,14 +491,20 @@ async fn fetch_booru_page(
         format!("Booru user {}", username)
     };
 
-    let client = reqwest::Client::new();
-    let res = client
+    // Errors go through `describe_http_error`, since these URLs contain the user's API key
+    let res = api::http_client()
         .get(&url)
         .header("User-Agent", user_agent)
+        .timeout(api::API_TIMEOUT)
         .send()
         .await
-        .map_err(|e| e.to_string())?;
-    let json: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+        .map_err(api::describe_http_error)?;
+
+    if !res.status().is_success() {
+        return Err(format!("{} returned HTTP {}", service, res.status()));
+    }
+
+    let json: serde_json::Value = res.json().await.map_err(api::describe_http_error)?;
 
     let mut images = Vec::new();
     let items = if service == "Gelbooru" {
@@ -503,8 +577,28 @@ async fn download_image(
     std::fs::create_dir_all(&dl_dir).map_err(|e| e.to_string())?;
     let dest = dl_dir.join(filename);
 
-    let res = reqwest::get(&url).await.map_err(|e| e.to_string())?;
-    let bytes = res.bytes().await.map_err(|e| e.to_string())?;
+    // No overall timeout here (images can be large) - the client's read timeout catches stalls
+    let res = api::http_client()
+        .get(&url)
+        .send()
+        .await
+        .map_err(api::describe_http_error)?;
+
+    if !res.status().is_success() {
+        return Err(format!("HTTP {}", res.status()));
+    }
+
+    // Some image hosts answer blocked/expired links with "200 OK" and an HTML page
+    let is_html = res
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.trim_start().to_ascii_lowercase().starts_with("text/html"));
+    if is_html {
+        return Err("The server returned a web page instead of the image.".to_string());
+    }
+
+    let bytes = res.bytes().await.map_err(api::describe_http_error)?;
     std::fs::write(&dest, bytes).map_err(|e| e.to_string())?;
 
     Ok(())
@@ -611,6 +705,15 @@ pub fn run() {
     let api_client = Arc::new(ApiClient::new(live_config.clone()));
 
     tauri::Builder::default()
+        // Must be registered first. Two instances would both watch the input folder and fight over
+        // the same files, so a second launch just brings the already running window to the front.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
@@ -649,16 +752,10 @@ pub fn run() {
             std::fs::create_dir_all(&config_dir).expect("Failed to create config dir");
             let config_path = config_dir.join("config.json");
 
-            let config: AppConfig = if config_path.exists() {
-                let config_data = std::fs::read_to_string(&config_path).unwrap_or_default();
-                serde_json::from_str(&config_data).unwrap_or_default()
-            } else {
-                let default_config = AppConfig::default();
-                if let Ok(json) = serde_json::to_string_pretty(&default_config) {
-                    let _ = std::fs::write(&config_path, json);
-                }
-                default_config
-            };
+            let config::LoadedConfig { config, warnings } = config::load(&config_path);
+            for warning in &warnings {
+                println!("Warning: {}", warning);
+            }
 
             let is_permanently_scanning = config.flags.get("isPermanentScan").copied().unwrap_or(true);
             scan_active_flag.store(is_permanently_scanning, std::sync::atomic::Ordering::Relaxed);
@@ -738,6 +835,7 @@ pub fn run() {
                 queue_tx,
                 queued_tracker,
                 config: live_config,
+                startup_warnings: Mutex::new(warnings),
             });
 
             Ok(())

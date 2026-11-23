@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 -->
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue';
+import { ref, computed, onActivated } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { DownloadCloudIcon, StopCircleIcon, FolderOpenIcon } from 'lucide-vue-next';
 
@@ -52,7 +52,9 @@ const availableServices = computed(() => [
 // ---- LIFECYCLE ------------------*
 // ---------------------------------*
 
-onMounted(async () => {
+// The view is kept alive across tab switches, so this runs on every visit (incl. the first)
+// to pick up folder changes made in Settings in the meantime.
+onActivated(async () => {
   // Fetch the custom downloads folder name from the user's config
   try {
     const config: any = await invoke('get_config');
@@ -89,6 +91,7 @@ const openDlFolder = async () => {
  * so the process can be safely aborted midway.
  */
 const startDownload = async () => {
+  if (isDownloading.value) return; // Never run two download loops at once
   if (!tags.value.trim()) return alert("Please enter at least one tag.");
   
   isDownloading.value = true;
