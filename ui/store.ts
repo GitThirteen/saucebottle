@@ -19,7 +19,7 @@
 import { computed, ref } from 'vue';
 import { listen } from '@tauri-apps/api/event';
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
-import { logger } from './logger';
+import { logger, type LogDetail } from './logger';
 
 // ---------------------------------*
 // ---- TYPES & CONSTANTS ----------*
@@ -51,6 +51,8 @@ export const autoUpdateEnabled = ref(true);
 export const isPermanentScan = ref(true);
 export const isProcessing = ref(true);
 export const confidenceThreshold = ref(80);
+/** Goes up each time the settings were saved, for views that depend on them. */
+export const settingsSavedTick = ref(0);
 
 // -- Updater State --
 export const updateProgress = ref(0);
@@ -87,6 +89,17 @@ const uiQueue: UIEvent[] = [];
 let isUILoopRunning = false;
 let lastProcStartTime = 0;
 let isInitialized = false;
+let returnToWelcomeTimer: number | undefined;
+
+/** How long a finished result stays up (for Copy path / Open folder) when nothing is left to process. */
+const RESULT_LINGER_MS = 8000;
+
+/** Size info of the images being processed, by file name. Used for their log rows afterwards. */
+const imageInfoByFile = new Map<string, string>();
+
+/** Builds a `LogDetail` list from label/value pairs and skips the ones without a value. */
+const toDetails = (pairs: [string, string | undefined | null][]): LogDetail[] =>
+    pairs.filter((pair): pair is [string, string] => !!pair[1]).map(([label, value]) => ({ label, value }));
 
 // ---------------------------------*
 // ---- COMPUTED & WATCHERS --------*
@@ -145,6 +158,23 @@ export const refreshVaultStatus = async () => {
 };
 
 /**
+ * Goes from the result screen back to the welcome screen after a delay, once everything is done.
+ * Does nothing while images are still queued or shown. It's called again whenever the UI loop
+ * finishes or the queue shrinks, and cancelled when a new image starts.
+ */
+const armReturnToWelcome = () => {
+    clearTimeout(returnToWelcomeTimer);
+
+    if (appState.value !== 'result' || isUILoopRunning || uiQueue.length > 0 || queueCount.value > 0) return;
+
+    returnToWelcomeTimer = window.setTimeout(() => {
+        if (appState.value === 'result' && !isUILoopRunning && uiQueue.length === 0 && queueCount.value === 0) {
+            appState.value = 'welcome';
+        }
+    }, RESULT_LINGER_MS);
+};
+
+/**
  * A dedicated asynchronous consumer loop for UI events.
  * Because the Rust backend sometimes processes images faster than the UI can display them,
  * this loop queues the incoming events and forces artificial delays (e.g., waiting at least
@@ -153,6 +183,7 @@ export const refreshVaultStatus = async () => {
  */
 const runUILoop = async () => {
     isUILoopRunning = true;
+    clearTimeout(returnToWelcomeTimer);
 
     while (uiQueue.length > 0) {
         // Processing already runs during the boot/update screen; just don't show it until that's done
@@ -181,7 +212,11 @@ const runUILoop = async () => {
             activeImage.value = convertFileSrc(event.payload.path);
             lastProcStartTime = Date.now();
 
-            logger.info(`Processing: ${event.payload.filename} (${event.payload.width}×${event.payload.height}, ${event.payload.size_kb} KB)`);
+            const imageInfo = `${event.payload.width}×${event.payload.height}, ${event.payload.size_kb} KB`;
+            if (imageInfoByFile.size > 200) imageInfoByFile.clear();
+            imageInfoByFile.set(event.payload.filename, imageInfo);
+
+            logger.debug(`Processing ${event.payload.filename}`, { details: toDetails([['Image', imageInfo]]) });
         }
         else if (event.type === 'succ') {
             // Force a minimum loading screen time of 600ms so the UI doesn't flash
@@ -202,10 +237,22 @@ const runUILoop = async () => {
             appState.value = 'result';
 
             const isOriginal = p.name === 'Original' || p.name === '0riginal';
+            const hasArtist = p.artist && p.artist !== 'Unknown';
             const who = isOriginal
-                ? `Original by ${p.artist !== 'Unknown' ? p.artist : 'Anon'}`
-                : `${p.name} (${p.fandom})`;
-            logger.success(`Sorted → ${who} · ${p.similarity}% via ${p.service} → ${p.file_path}`);
+                ? `Original by ${hasArtist ? p.artist : 'Anon'}`
+                : `${p.fandom} / ${p.name}`;
+            const file = p.source_file || 'Image';
+
+            logger.success(`${file} → ${who} (${p.similarity}%)`, {
+                details: toDetails([
+                    ['Service', p.service],
+                    ['Match', `${p.similarity}%`],
+                    ['Saved to', p.file_path],
+                    ['Artist', hasArtist ? p.artist : null],
+                    ['Image', imageInfoByFile.get(p.source_file)],
+                ])
+            });
+            imageInfoByFile.delete(p.source_file);
 
             // Keep the success result on screen for 2 seconds before grabbing the next queue item
             await sleep(2000);
@@ -214,10 +261,22 @@ const runUILoop = async () => {
             const elapsed = Date.now() - lastProcStartTime;
             if (elapsed < 600) await sleep(600 - elapsed);
 
-            errorMessage.value = event.payload || "An unknown processing error occurred.";
+            // The backend sends { file, message, moved_to } (a plain string is accepted too)
+            const failure = typeof event.payload === 'string' ? { message: event.payload } : (event.payload || {});
+            const reason = failure.message || "An unknown processing error occurred";
+
+            errorMessage.value = reason;
             appState.value = 'error';
 
-            logger.error(event.payload || 'Unknown processing error');
+            const subject = failure.file ? `${failure.file}: ` : '';
+            const movedNote = failure.moved_to ? ` (moved to ${failure.moved_to})` : '';
+            logger.error(`${subject}${reason}${movedNote}`, {
+                details: toDetails([
+                    ['Moved to', failure.moved_to],
+                    ['Image', failure.file ? imageInfoByFile.get(failure.file) : null],
+                ])
+            });
+            if (failure.file) imageInfoByFile.delete(failure.file);
 
             // Keep the error on screen for 3 seconds
             await sleep(3000);
@@ -226,6 +285,7 @@ const runUILoop = async () => {
     }
 
     isUILoopRunning = false;
+    armReturnToWelcome();
 };
 
 /**
@@ -239,14 +299,15 @@ export const initTauriListeners = async () => {
 
     logger.info('SauceBottle started.');
 
-    await listen('queue-add', () => {
+    await listen('queue-add', (ev: any) => {
         queueCount.value++;
-        logger.info(`File added to queue. Queue size: ${queueCount.value}`);
+        logger.debug(`Queued ${ev.payload || 'a file'} (${queueCount.value} in queue)`);
     });
 
     await listen('task-done', () => {
         if (queueCount.value > 0) queueCount.value--;
         syncOfflineQueue();
+        armReturnToWelcome();
     });
 
     await listen('image-processing', (ev: any) => {
@@ -256,6 +317,10 @@ export const initTauriListeners = async () => {
 
     await listen('warn', (ev: any) => {
         logger.warn(ev.payload);
+    });
+
+    await listen('info', (ev: any) => {
+        logger.info(ev.payload);
     });
 
     await listen('success', (ev: any) => {

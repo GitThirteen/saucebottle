@@ -25,7 +25,10 @@ use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::api::ApiClient;
+use crate::models::Failure;
 use crate::processor;
+use crate::stats::StatsStore;
+use crate::storage;
 
 // ---------------------------------*
 // ---- LISTENER.RS ----------------*
@@ -55,6 +58,11 @@ fn is_temp_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|ext| TEMP_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+}
+
+/// The file's name for showing to the user. The folder is always the same, so it's left out.
+fn file_label(path: &Path) -> String {
+    path.file_name().unwrap_or_default().to_string_lossy().into_owned()
 }
 
 /// Outcome of waiting for a file to be fully written.
@@ -121,7 +129,7 @@ async fn wait_for_file_ready(path: &Path) -> Result<FileState, &'static str> {
         }
 
         if unchanged_since.elapsed() > STALL_TIMEOUT {
-            return Err("Timed out waiting for file to finish writing to disk.");
+            return Err("Timed out waiting for the file to finish writing (is another program still using it?)");
         }
 
         tokio::time::sleep(current_delay).await;
@@ -158,7 +166,7 @@ async fn process_single_file(
         }
         Err(e) => {
             queued_tracker.lock().unwrap().remove(&path);
-            let _ = handle.emit("failure", format!("File read error on {:?}: {}", path.file_name().unwrap_or_default(), e));
+            let _ = handle.emit("failure", Failure { file: file_label(&path), message: e.to_string(), moved_to: None });
             let _ = handle.emit("task-done", ());
             return;
         }
@@ -185,6 +193,8 @@ async fn process_single_file(
         (&config_snapshot.invalid_folder).into()
     };
 
+    let started = Instant::now();
+
     let process_result = async {
         let info = processor::process_image(&path)?;
 
@@ -206,7 +216,7 @@ async fn process_single_file(
 
         if is_mismatch {
             let msg = format!(
-                "Filetype mismatch on '{}': extension is .{}, but the file is actually a {}",
+                "{}: the extension says .{}, but the file is actually a {} image",
                 info.filename, ext, info.format
             );
             let _ = handle.emit("warn", msg.clone());
@@ -267,6 +277,11 @@ async fn process_single_file(
             .trim_start_matches(['/', '\\'])
             .replace('\\', "/");
         booru_data.file_path = display_path;
+        booru_data.source_file = file_label(&path);
+
+        if let Some(stats) = handle.try_state::<StatsStore>() {
+            stats.record_sort(&config_snapshot, &booru_data, info.size_kb, started.elapsed());
+        }
 
         let _ = handle.emit("success", booru_data);
         Ok::<(), String>(())
@@ -274,20 +289,32 @@ async fn process_single_file(
     .await;
 
     if let Err(e) = process_result {
+        if let Some(stats) = handle.try_state::<StatsStore>() {
+            stats.record_failure(&config_snapshot);
+        }
         println!(
             "Error: Error processing {:?}: {}",
             path.file_name().unwrap_or_default(),
             e
         );
-        if let Err(move_err) =
-            processor::move_to_invalid(&path, &config_snapshot, &default_results_dir)
-        {
-            println!("Error: Failed to move to invalid folder: {}", move_err);
-        } else {
-            println!("Error: Moved to invalid folder: {}", invalid_folder);
-        }
+        let invalid_name = match config_snapshot.invalid_folder.trim() {
+            "" => ".invalid",
+            name => name,
+        };
 
-        let _ = handle.emit("failure", e);
+        // Say where the image ended up, or why it couldn't be moved
+        let (message, moved_to) = match processor::move_to_invalid(&path, &config_snapshot, &default_results_dir) {
+            Ok(()) => {
+                println!("Error: Moved to invalid folder: {}", invalid_folder);
+                (e, Some(invalid_name.to_string()))
+            }
+            Err(move_err) => {
+                println!("Error: Failed to move to invalid folder: {}", move_err);
+                (format!("{}. It also could not be moved to the {} folder: {}", e, invalid_name, move_err), None)
+            }
+        };
+
+        let _ = handle.emit("failure", Failure { file: file_label(&path), message, moved_to });
     }
 
     queued_tracker.lock().unwrap().remove(&path);
@@ -298,7 +325,8 @@ async fn process_single_file(
 /// This acts as a catch-up mechanism for files added while the app was closed or paused.
 ///
 /// # Arguments
-/// * `handle` - The Tauri AppHandle for resolving directory paths.
+/// * `handle` - The Tauri AppHandle for emitting queue events.
+/// * `input_dir` - The input folder to sweep (see `config::input_dir`).
 /// * `tx` - The transmit channel to send found files to the processor queue.
 /// * `queued_tracker` - Thread-safe set to prevent re-queuing files already in progress.
 ///
@@ -306,12 +334,11 @@ async fn process_single_file(
 /// * `usize` - The number of files newly added to the queue (files already queued aren't counted).
 pub fn run_sweep(
     handle: &AppHandle,
+    input_dir: &Path,
     tx: &Sender<PathBuf>,
     queued_tracker: &Arc<Mutex<HashSet<PathBuf>>>,
 ) -> usize {
-    // [TODO] This is defined twice, mild bug hazard
-    let app_dir = handle.path().picture_dir().expect("Path resolution failed");
-    let watch_path = app_dir.join("SauceBottle").join("input");
+    let watch_path = input_dir;
     let mut queued = 0;
 
     println!("Sweeping folder for unprocessed files...");
@@ -320,7 +347,7 @@ pub fn run_sweep(
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() && !is_temp_file(&path) && tracker.insert(path.clone()) {
-                let _ = handle.emit("queue-add", ());
+                let _ = handle.emit("queue-add", file_label(&path));
                 let _ = tx.send(path);
                 queued += 1;
             }
@@ -328,6 +355,79 @@ pub fn run_sweep(
     }
 
     queued
+}
+
+/// Messages for the file-system watcher thread.
+enum WatchMsg {
+    /// An event (or error) reported by the OS watcher.
+    Event(notify::Result<notify::Event>),
+    /// Watch this folder from now on instead of the current one.
+    SetInputDir(PathBuf),
+    /// Watch the current folder again (a network share that came back has lost its watch).
+    Rewatch,
+}
+
+/// Lets other parts of the app point the running watcher at a different input folder.
+#[derive(Clone)]
+pub struct WatchControl(Sender<WatchMsg>);
+
+impl WatchControl {
+    /// Switches the watcher to another input folder. Does nothing if it's already watched.
+    pub fn set_input_dir(&self, dir: PathBuf) {
+        let _ = self.0.send(WatchMsg::SetInputDir(dir));
+    }
+
+    /// Watches the current input folder again.
+    pub fn rewatch(&self) {
+        let _ = self.0.send(WatchMsg::Rewatch);
+    }
+}
+
+/// Tracks whether the input and output folders can be reached. This matters when one of them is on
+/// a network share or an external drive.
+///
+/// An image is searched on IQDB before its file is moved. With an unreachable folder, every image
+/// would be searched, fail to move, and be searched again by the next sweep. So processing waits
+/// until both folders answer, and the user gets one message when that starts and one when it ends.
+struct StorageGuard {
+    handle: AppHandle,
+    client: Arc<ApiClient>,
+    watch: WatchControl,
+    down: AtomicBool,
+}
+
+impl StorageGuard {
+    /// Returns `true` if the input and output folder can both be reached right now.
+    /// Warns when that stops being true. When they're back, says so and sets up the folder watch again.
+    fn is_up(&self) -> bool {
+        let config = self.client.config();
+        let folders = [
+            ("input", crate::config::input_dir(&self.handle, &config)),
+            ("output", crate::config::results_dir(&self.handle, &config)),
+        ];
+
+        let unreachable: Vec<String> = folders
+            .iter()
+            .filter(|(_, dir)| !storage::is_reachable(dir, storage::PROBE_TIMEOUT))
+            .map(|(name, dir)| format!("{} folder ({})", name, storage::plain_path(dir)))
+            .collect();
+
+        if unreachable.is_empty() {
+            if self.down.swap(false, Ordering::SeqCst) {
+                let _ = self.handle.emit("info", "The input and output folders are reachable again. Processing continues.");
+                self.watch.rewatch();
+            }
+            true
+        } else {
+            if !self.down.swap(true, Ordering::SeqCst) {
+                let _ = self.handle.emit(
+                    "warn",
+                    format!("Can't reach the {}. Processing is on hold until it is available again.", unreachable.join(" and the ")),
+                );
+            }
+            false
+        }
+    }
 }
 
 /// Initializes the core background daemon for SauceBottle.
@@ -342,20 +442,33 @@ pub fn run_sweep(
 /// * `is_scanning` - Atomic flag controlling whether the app should process or ignore files (Pause/Resume feature).
 ///
 /// # Returns
-/// * `(Sender<PathBuf>, Arc<Mutex<HashSet<PathBuf>>>)` - Returns the channel transmitter so external commands
-///                                                              (like `run_sweep`) can feed files into the queue,
-///                                                              along with the active queue tracker.
+/// * `(Sender<PathBuf>, Arc<Mutex<HashSet<PathBuf>>>, WatchControl)` - Returns the channel transmitter so external
+///   commands (like `run_sweep`) can feed files into the queue, the active queue tracker, and a handle
+///   to switch the watched input folder at runtime.
 pub fn spawn_watcher(
     handle: AppHandle,
     api_client: Arc<ApiClient>,
     is_scanning: Arc<AtomicBool>,
-) -> (Sender<PathBuf>, Arc<Mutex<HashSet<PathBuf>>>) {
+) -> (Sender<PathBuf>, Arc<Mutex<HashSet<PathBuf>>>, WatchControl) {
     let (proc_tx, proc_rx) = channel::<PathBuf>();
     let queued_tracker = Arc::new(Mutex::new(HashSet::new()));
 
     let processor_handle = handle.clone();
     let processor_scanning = is_scanning.clone();
     let worker_tracker = queued_tracker.clone();
+    let heartbeat_client = api_client.clone();
+    let observer_client = api_client.clone();
+
+    let (watch_msg_tx, watch_msg_rx) = channel::<WatchMsg>();
+    let watch_control = WatchControl(watch_msg_tx.clone());
+
+    let storage_guard = Arc::new(StorageGuard {
+        handle: handle.clone(),
+        client: api_client.clone(),
+        watch: watch_control.clone(),
+        down: AtomicBool::new(false),
+    });
+    let worker_guard = storage_guard.clone();
 
     // Thread 1: Worker/Processor
     std::thread::spawn(move || {
@@ -374,7 +487,12 @@ pub fn spawn_watcher(
                     continue;
                 }
             }
-            
+
+            // Wait here while the input or output folder can't be reached (see `StorageGuard`)
+            while !worker_guard.is_up() {
+                std::thread::sleep(Duration::from_secs(10));
+            }
+
             rt.block_on(async {
                 process_single_file(
                     path,
@@ -395,21 +513,57 @@ pub fn spawn_watcher(
     // Thread 2: OS File-System Observer
     std::thread::spawn(move || {
         let handle = observer_handle;
-        let app_data_dir = handle
-            .path()
-            .picture_dir()
-            .expect("Failed to resolve observer path");
-        let input_dir = app_data_dir.join("SauceBottle").join("input");
+        let mut input_dir = crate::config::input_dir(&handle, &observer_client.config());
 
-        std::fs::create_dir_all(&input_dir).expect("Dir creation failed");
+        if let Err(e) = std::fs::create_dir_all(&input_dir) {
+            println!("Error: Could not create input folder {:?}: {}", input_dir, e);
+        }
 
-        let (tx, rx) = channel();
-        let mut watcher = RecommendedWatcher::new(tx, Config::default()).expect("Watcher failed");
-        watcher
-            .watch(&input_dir, RecursiveMode::Recursive)
-            .expect("Watch failed");
+        let event_tx = watch_msg_tx;
+        let mut watcher = RecommendedWatcher::new(
+            move |res| { let _ = event_tx.send(WatchMsg::Event(res)); },
+            Config::default(),
+        )
+        .expect("Watcher failed");
+        if let Err(e) = watcher.watch(&input_dir, RecursiveMode::Recursive) {
+            println!("Error: Could not watch input folder {:?}: {}", input_dir, e);
+        }
 
-        for res in rx {
+        for msg in watch_msg_rx {
+            let res = match msg {
+                WatchMsg::Event(res) => res,
+                WatchMsg::Rewatch => {
+                    let _ = watcher.unwatch(&input_dir);
+                    let _ = std::fs::create_dir_all(&input_dir);
+                    if let Err(e) = watcher.watch(&input_dir, RecursiveMode::Recursive) {
+                        println!("Error: Could not watch input folder {:?}: {}", input_dir, e);
+                    }
+                    continue;
+                }
+                WatchMsg::SetInputDir(new_dir) => {
+                    if new_dir == input_dir {
+                        continue;
+                    }
+
+                    let _ = watcher.unwatch(&input_dir);
+                    let switched = std::fs::create_dir_all(&new_dir)
+                        .map_err(|e| e.to_string())
+                        .and_then(|_| watcher.watch(&new_dir, RecursiveMode::Recursive).map_err(|e| e.to_string()));
+
+                    match switched {
+                        Ok(()) => {
+                            println!("Now watching input folder {:?}", new_dir);
+                            input_dir = new_dir;
+                        }
+                        Err(e) => {
+                            // Go back to the old folder so we don't end up watching nothing
+                            let _ = watcher.watch(&input_dir, RecursiveMode::Recursive);
+                            let _ = handle.emit("warn", format!("Could not watch the new input folder {:?}: {}", new_dir, e));
+                        }
+                    }
+                    continue;
+                }
+            };
             let Ok(event) = res else { continue }; // Skip if invalid event
 
             if !observer_scanning.load(Ordering::Relaxed) { // Skip if scanning is turned off
@@ -418,7 +572,7 @@ pub fn spawn_watcher(
 
             // The OS dropped events (e.g. buffer overflow) - we can't know what we missed, so sweep
             if event.need_rescan() {
-                run_sweep(&handle, &watch_tx_clone, &observer_tracker);
+                run_sweep(&handle, &input_dir, &watch_tx_clone, &observer_tracker);
                 continue;
             }
 
@@ -443,7 +597,7 @@ pub fn spawn_watcher(
                 }
 
                 println!("Detected new drop: {:?}", path);
-                let _ = handle.emit("queue-add", ());
+                let _ = handle.emit("queue-add", file_label(&path));
                 let _ = watch_tx_clone.send(path);
             }
         }
@@ -456,8 +610,9 @@ pub fn spawn_watcher(
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(HEARTBEAT_INTERVAL);
-            if is_scanning.load(Ordering::Relaxed) {
-                run_sweep(&handle, &heartbeat_tx, &heartbeat_tracker);
+            if is_scanning.load(Ordering::Relaxed) && storage_guard.is_up() {
+                let input_dir = crate::config::input_dir(&handle, &heartbeat_client.config());
+                run_sweep(&handle, &input_dir, &heartbeat_tx, &heartbeat_tracker);
             }
         }
     });
@@ -467,5 +622,5 @@ pub fn spawn_watcher(
     // - A separate thread for the batch DL tab so the backend handles this gracefully. Right now, the frontend actually handles that asynchronously, and in the >>> worst case <<< this could result in an IP ban.
     // - Others?
 
-    (proc_tx, queued_tracker)
+    (proc_tx, queued_tracker, watch_control)
 }

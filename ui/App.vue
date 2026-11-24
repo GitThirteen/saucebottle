@@ -33,7 +33,6 @@ import {
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { invoke } from '@tauri-apps/api/core';
 import { check } from '@tauri-apps/plugin-updater';
-import { relaunch } from '@tauri-apps/plugin-process';
 import { ask } from '@tauri-apps/plugin-dialog';
 
 import CredentialsView from './components/Credentials.vue';
@@ -56,6 +55,7 @@ import {
   queueCount
 } from './store';
 import { logger, unreadCount, setLogTabOpen } from './logger';
+import { installUpdate } from './updater';
 import './assets/main.css';
 
 // ---------------------------------*
@@ -139,7 +139,8 @@ const openResultsFolder = async () => {
   try { 
     await invoke('open_system_folder', { folderTarget: 'results' }); 
   } catch (e) { 
-    console.error("Failed to open results folder", e); 
+    console.error("Failed to open results folder", e);
+    logger.error(`Could not open the results folder: ${e}`);
   }
 };
 
@@ -179,30 +180,7 @@ const runBootSequence = async () => {
       );
 
       if (wantsUpdate) {
-        let downloaded = 0;
-        let contentLength = 0;
-
-        await update.downloadAndInstall((event) => {
-          switch (event.event) {
-            case 'Started':
-              contentLength = event.data.contentLength || 0;
-              updateStatus.value = `Downloading v${update.version}...`;
-              break;
-            case 'Progress':
-              downloaded += event.data.chunkLength;
-              if (contentLength > 0) {
-                updateProgress.value = Math.round((downloaded / contentLength) * 100);
-              }
-              break;
-            case 'Finished':
-              updateStatus.value = 'Installing...';
-              updateProgress.value = 100;
-              break;
-          }
-        });
-
-        updateStatus.value = 'Restarting SauceBottle...';
-        await relaunch(); 
+        await installUpdate(update);
         return;
       }
     }
@@ -283,6 +261,11 @@ onMounted(async () => {
 
 onUnmounted(() => {
   unlistenDragDrop?.();
+});
+
+// The update progress is on the home tab, so jump there when an update starts from Settings
+watch(appState, (state) => {
+  if (state === 'updating' && currentTab.value !== 'main') setTab('main');
 });
 
 // Manual mode: end the run once the queue has been worked off. This deliberately keys off the

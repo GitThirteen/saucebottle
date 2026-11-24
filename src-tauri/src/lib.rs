@@ -19,6 +19,8 @@ mod config;
 mod listener;
 mod models;
 mod processor;
+mod stats;
+mod storage;
 
 use std::collections::HashSet;
 use std::fs;
@@ -47,9 +49,17 @@ struct AppState {
     is_active: Arc<AtomicBool>,
     queue_tx: std::sync::mpsc::Sender<PathBuf>,
     queued_tracker: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Lets us point the file watcher at a new input folder when the setting changes.
+    watch_control: listener::WatchControl,
     config: Arc<Mutex<Arc<AppConfig>>>,
     /// Problems found while loading the config, shown in the Logs tab once the UI is listening.
     startup_warnings: Mutex<Vec<String>>,
+}
+
+/// The input folder as currently configured.
+fn current_input_dir(state: &AppState, handle: &tauri::AppHandle) -> PathBuf {
+    let config = state.config.lock().unwrap().clone();
+    config::input_dir(handle, &config)
 }
 
 #[derive(serde::Serialize)]
@@ -76,7 +86,8 @@ fn set_scan_state(active: bool, state: tauri::State<'_, AppState>, handle: tauri
     println!("Scan state set to: {}", active);
 
     if active && !was_active {
-        return listener::run_sweep(&handle, &state.queue_tx, &state.queued_tracker);
+        let input_dir = current_input_dir(&state, &handle);
+        return listener::run_sweep(&handle, &input_dir, &state.queue_tx, &state.queued_tracker);
     }
 
     0
@@ -112,6 +123,10 @@ fn save_config(
     use tauri::Manager;
     use tauri_plugin_autostart::ManagerExt;
     
+    // Reject an unusable input folder before anything gets saved
+    config::validate_input_folder(&handle, &config)?;
+    let old_input_dir = current_input_dir(&state, &handle);
+
     // Using the secure App Config Directory
     let config_dir = handle.path().app_config_dir().map_err(|e| e.to_string())?;
     fs::create_dir_all(&config_dir).map_err(|e| e.to_string())?;
@@ -127,8 +142,24 @@ fn save_config(
         let _ = autolaunch.disable();
     }
 
+    let new_input_dir = config::input_dir(&handle, &config);
+
     // Wrap the saved config in the PR's new Arc
     *state.config.lock().unwrap() = Arc::new(config);
+
+    // New input folder: watch it and process what's already in there
+    if new_input_dir != old_input_dir {
+        state.watch_control.set_input_dir(new_input_dir.clone());
+
+        if state.is_active.load(Ordering::Relaxed) {
+            let tx = state.queue_tx.clone();
+            let tracker = state.queued_tracker.clone();
+            std::thread::spawn(move || {
+                listener::run_sweep(&handle, &new_input_dir, &tx, &tracker);
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -147,11 +178,12 @@ fn frontend_ready(state: tauri::State<'_, AppState>, handle: tauri::AppHandle) {
     }
 
     if state.is_active.load(Ordering::Relaxed) {
+        let input_dir = current_input_dir(&state, &handle);
         let tx = state.queue_tx.clone();
         let tracker = state.queued_tracker.clone();
         std::thread::spawn(move || {
             println!("Triggering initial sweep...");
-            listener::run_sweep(&handle, &tx, &tracker);
+            listener::run_sweep(&handle, &input_dir, &tx, &tracker);
         });
     }
 }
@@ -181,12 +213,13 @@ fn save_credential(
     println!("Saved {} credentials.", service);
 
     if state.is_active.load(Ordering::Relaxed) {
+        let input_dir = current_input_dir(&state, &handle);
         let tx = state.queue_tx.clone();
         let tracker = state.queued_tracker.clone();
 
         std::thread::spawn(move || {
             println!("Triggering sweep...");
-            listener::run_sweep(&handle, &tx, &tracker);
+            listener::run_sweep(&handle, &input_dir, &tx, &tracker);
         });
     }
 
@@ -366,13 +399,12 @@ fn process_dropped_files(
     state: tauri::State<'_, AppState>,
     handle: tauri::AppHandle,
 ) -> Result<String, String> {
-    let docs_dir = handle.path().picture_dir().expect("Path resolution failed");
-    let saucebottle_dir = docs_dir.join("SauceBottle");
-    let input_dir = saucebottle_dir.join("input");
+    let saucebottle_dir = config::default_root(&handle);
+    let config = state.config.lock().unwrap().clone();
+    let input_dir = config::input_dir(&handle, &config);
 
     fs::create_dir_all(&input_dir).map_err(|e| e.to_string())?;
 
-    let config = state.config.lock().unwrap().clone();
     let results_dir = if config.output_folder.trim().is_empty() {
         saucebottle_dir.join("results")
     } else {
@@ -390,9 +422,10 @@ fn process_dropped_files(
         import_to_input_recursive(Path::new(&p), &input_dir, 0, &own_folders, &mut stats)?;
     }
 
-    let mut message = format!("Successfully queued {} images.", stats.imported);
+    let noun = if stats.imported == 1 { "image" } else { "images" };
+    let mut message = format!("Imported {} dropped {}", stats.imported, noun);
     if stats.skipped_own_folders {
-        message.push_str(" SauceBottle's own input/results folders were skipped.");
+        message.push_str(" (SauceBottle's own input and results folders were skipped)");
     }
     Ok(message)
 }
@@ -401,15 +434,14 @@ fn process_dropped_files(
 /// (Used to populate the offline/paused queue badge on the welcome screen.)
 ///
 /// # Arguments
+/// * `state` - The managed Tauri application state (for the configured input folder).
 /// * `handle` - The Tauri AppHandle.
 ///
 /// # Returns
 /// * `Result<usize, String>` - The number of valid images found.
 #[tauri::command]
-fn check_input_folder(handle: tauri::AppHandle) -> Result<usize, String> {
-    let docs_dir = handle.path().picture_dir().expect("Path resolution failed");
-    let saucebottle_dir = docs_dir.join("SauceBottle");
-    let input_dir = saucebottle_dir.join("input");
+fn check_input_folder(state: tauri::State<'_, AppState>, handle: tauri::AppHandle) -> Result<usize, String> {
+    let input_dir = current_input_dir(&state, &handle);
 
     // Count how many files in the folder are valid images
     let count = std::fs::read_dir(input_dir)
@@ -553,6 +585,7 @@ async fn download_image(
     url: String,
     filename: String,
     state: tauri::State<'_, AppState>,
+    stats: tauri::State<'_, stats::StatsStore>,
     handle: tauri::AppHandle,
 ) -> Result<(), String> {
     let config = state.config.lock().unwrap().clone();
@@ -601,7 +634,21 @@ async fn download_image(
     let bytes = res.bytes().await.map_err(api::describe_http_error)?;
     std::fs::write(&dest, bytes).map_err(|e| e.to_string())?;
 
+    stats.record_download(&config);
     Ok(())
+}
+
+/// Numbers for the statistics card (all empty if statistics are off).
+#[tauri::command]
+fn get_stats(state: tauri::State<'_, AppState>, stats: tauri::State<'_, stats::StatsStore>) -> stats::StatsView {
+    let config = state.config.lock().unwrap().clone();
+    stats.view(&config)
+}
+
+/// Resets all statistics.
+#[tauri::command]
+fn reset_stats(stats: tauri::State<'_, stats::StatsStore>) -> Result<(), String> {
+    stats.reset()
 }
 
 /// Attempts to spawn the native OS file explorer (Windows Explorer, Finder, or Linux File Manager)
@@ -651,11 +698,16 @@ fn open_system_folder(
         target_dir = std::path::PathBuf::from(folder_target);
     }
 
+    // A network share that is off would freeze the window for ~20 seconds in the calls below
+    if !storage::is_reachable(&target_dir, storage::PROBE_TIMEOUT) {
+        return Err(format!("The folder '{}' can't be reached. Check that the drive or network share is connected.", target_dir.display()));
+    }
+
     // Ensure the directory actually exists so the OS doesn't throw an error
     let _ = std::fs::create_dir_all(&target_dir);
 
     let absolute_path = std::fs::canonicalize(&target_dir).unwrap_or(target_dir);
-    let clean_path = absolute_path.to_string_lossy().replace("\\\\?\\", "");
+    let clean_path = storage::plain_path(&absolute_path);
 
     println!("Opening: {}", clean_path);
 
@@ -679,6 +731,36 @@ fn open_system_folder(
         .map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+/// File that tells the next start an update was just installed.
+const UPDATE_MARKER: &str = "update_restart.flag";
+
+/// Notes that an update to `version` is about to be installed, so the restarted app shows its window
+/// even with "start minimized" on. The frontend calls this right before installing.
+///
+/// # Arguments
+/// * `version` - The version being installed.
+/// * `handle` - The Tauri AppHandle for path resolution.
+#[tauri::command]
+fn mark_update_restart(version: String, handle: tauri::AppHandle) -> Result<(), String> {
+    let config_dir = handle.path().app_config_dir().map_err(|e| e.to_string())?;
+    fs::create_dir_all(&config_dir).map_err(|e| e.to_string())?;
+    fs::write(config_dir.join(UPDATE_MARKER), version).map_err(|e| e.to_string())
+}
+
+/// Reads and deletes the marker from [`mark_update_restart`].
+///
+/// # Returns
+/// * `bool` - `true` if the marker names the version that is running now, meaning the update went
+///   through. A marker left by a failed install is thrown away.
+fn took_update_marker(config_dir: &Path, running_version: &str) -> bool {
+    let marker = config_dir.join(UPDATE_MARKER);
+    let Ok(version) = fs::read_to_string(&marker) else {
+        return false;
+    };
+    let _ = fs::remove_file(&marker);
+    version.trim() == running_version
 }
 
 /// The main application entry point.
@@ -736,7 +818,10 @@ pub fn run() {
             check_input_folder,
             fetch_booru_page,
             download_image,
-            open_system_folder
+            open_system_folder,
+            mark_update_restart,
+            get_stats,
+            reset_stats
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -752,7 +837,27 @@ pub fn run() {
             std::fs::create_dir_all(&config_dir).expect("Failed to create config dir");
             let config_path = config_dir.join("config.json");
 
-            let config::LoadedConfig { config, warnings } = config::load(&config_path);
+            let config::LoadedConfig { mut config, mut warnings } = config::load(&config_path);
+
+            // If the input folder is on a network share that is off right now, keep the setting.
+            // Processing waits until the folder is back (see listener::StorageGuard)
+            let custom_input = config.input_folder.trim();
+            let input_unreachable = !custom_input.is_empty()
+                && !storage::is_reachable(Path::new(custom_input), storage::PROBE_TIMEOUT);
+            if input_unreachable {
+                warnings.push(format!(
+                    "The input folder '{}' can't be reached right now. Processing starts as soon as it is available.",
+                    custom_input
+                ));
+            }
+
+            // A saved input folder that is invalid must not stop the app from starting
+            if input_unreachable {
+                // Can't be validated until it's back
+            } else if let Err(reason) = config::validate_input_folder(app.handle(), &config) {
+                warnings.push(format!("{} The default input folder is used for this session.", reason));
+                config.input_folder = String::new();
+            }
             for warning in &warnings {
                 println!("Warning: {}", warning);
             }
@@ -769,21 +874,24 @@ pub fn run() {
                 let _ = autolaunch.disable();
             }
 
+            // Always show the window after an update, so you can see SauceBottle is back
+            let just_updated = took_update_marker(&config_dir, &app.package_info().version.to_string());
             let start_minimized = config.flags.get("startMinimized").copied().unwrap_or(false);
-            if !start_minimized {
+            if !start_minimized || just_updated {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.show();
                     let _ = window.set_focus();
                 }
             }
             
-            let pic_dir = app.path().picture_dir().expect("Failed to resolve Pictures directory");
-            let saucebottle_dir = pic_dir.join("SauceBottle");
+            let saucebottle_dir = config::default_root(app.handle());
 
-            let input_dir = saucebottle_dir.join("input");
+            let input_dir = config::input_dir(app.handle(), &config);
             let results_dir = saucebottle_dir.join("results");
 
-            std::fs::create_dir_all(&input_dir).expect("Failed to create input directory");
+            if !input_unreachable {
+                std::fs::create_dir_all(&input_dir).expect("Failed to create input directory");
+            }
             std::fs::create_dir_all(&results_dir).expect("Failed to create results directory");
 
             println!(
@@ -827,13 +935,17 @@ pub fn run() {
                 })
                 .build(app);
 
-            let (queue_tx, queued_tracker) =
+            // Has to exist before the watcher starts, because the worker thread counts sorted images
+            app.manage(stats::StatsStore::load(config_dir.join("stats.json")));
+
+            let (queue_tx, queued_tracker, watch_control) =
                 listener::spawn_watcher(handle, client, scan_active_flag.clone());
 
             app.manage(AppState {
                 is_active: scan_active_flag,
                 queue_tx,
                 queued_tracker,
+                watch_control,
                 config: live_config,
                 startup_warnings: Mutex::new(warnings),
             });

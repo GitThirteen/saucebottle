@@ -93,59 +93,78 @@ const openDlFolder = async () => {
 const startDownload = async () => {
   if (isDownloading.value) return; // Never run two download loops at once
   if (!tags.value.trim()) return alert("Please enter at least one tag.");
-  
+
   isDownloading.value = true;
-  logger.info(`Starting batch download from ${selectedService.value} for tags: [${tags.value}]`);
-  
+
+  // One log row shows the progress and becomes the summary at the end, instead of a row per page and file
+  const details = [
+    { label: 'Service', value: selectedService.value },
+    { label: 'Tags', value: tags.value },
+    { label: 'Saved to', value: downloadsFolder.value },
+  ];
+  let saved = 0;
+  let failed = 0;
   let page = startPage.value;
+  const progressRow = logger.info('Starting batch download...', { details, merge: false });
+
+  const counts = () => `${saved} saved${failed > 0 ? `, ${failed} failed` : ''}`;
+  const showProgress = () => logger.update(progressRow, { message: `Downloading page ${page}: ${counts()}` });
+
   const end = typeof endPage.value === 'number' && endPage.value > 0 ? endPage.value : Infinity;
-  
+  let outcome: 'finished' | 'error' = 'finished';
+
   while (page <= end && isDownloading.value) {
-    logger.info(`Fetching Page ${page}...`);
+    showProgress();
     try {
       // 1. Fetch the JSON payload for the current page
-      const images: any[] = await invoke('fetch_booru_page', { 
-        service: selectedService.value, 
-        tags: tags.value, 
-        page 
+      const images: any[] = await invoke('fetch_booru_page', {
+        service: selectedService.value,
+        tags: tags.value,
+        page
       });
 
       // The page is empty (we reached the end of the search results)
-      if (images.length === 0) {
-        logger.info(`No more images found on page ${page}. Download complete!`);
-        break;
-      }
+      if (images.length === 0) break;
 
-      logger.info(`Found ${images.length} posts. Downloading...`);
-      
       // 2. Loop through every image on the page and invoke the Rust downloader
       for (const img of images) {
         if (!isDownloading.value) break; // Check if user clicked Abort
-        
+
         const filename = `${img.id}.${img.ext}`;
-        
+
         try {
           await invoke('download_image', { url: img.url, filename });
-          logger.success(`Downloaded ${filename}`);
+          saved++;
         } catch (e) {
-          logger.error(`Failed to download ${filename}: ${e}`);
+          failed++;
+          logger.error(`${filename}: download failed (${e})`);
         }
+        showProgress();
       }
-      
+
       // 3. Prepare for the next page, respecting the rate limit
       if (isDownloading.value) {
         await sleep(1000); // Lil' break so the sites don't hate us
         page++;
       }
     } catch (err) {
-      logger.error(`API Error on page ${page}: ${err}`);
+      logger.error(`Could not fetch page ${page}: ${err}`);
+      outcome = 'error';
       break;
     }
   }
-  
-  if (!isDownloading.value) logger.warn("Download manually aborted.");
-  else logger.success("Batch download finished.");
-  
+
+  // Turn the progress row into the summary
+  if (!isDownloading.value) {
+    logger.update(progressRow, { level: 'warn', message: `Download stopped: ${counts()}` });
+  } else if (outcome === 'error') {
+    logger.update(progressRow, { level: 'error', message: `Download stopped after an error: ${counts()}` });
+  } else if (saved === 0 && failed === 0) {
+    logger.update(progressRow, { level: 'info', message: 'No posts found for these tags' });
+  } else {
+    logger.update(progressRow, { level: failed > 0 ? 'warn' : 'success', message: `Download finished: ${counts()}` });
+  }
+
   isDownloading.value = false;
 };
 

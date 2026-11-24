@@ -330,7 +330,7 @@ impl ApiClient {
 
         if !res.status().is_success() {
             if res.status().as_u16() == 429 {
-                return Err("IQDB Rate Limit Exceeded. Please pause and try again later.".to_string());
+                return Err("IQDB rate limit reached. Pause for a while, then try again".to_string());
             }
             return Err(format!("IQDB Server Error: HTTP {}", res.status()));
         }
@@ -656,6 +656,7 @@ impl ApiClient {
             similarity,
             file_path: String::new(),
             is_original_work,
+            source_file: String::new(),
         })
     }
 
@@ -753,11 +754,11 @@ impl ApiClient {
         if let Some(m) = best_match {
             Ok(m)
         } else if let Some((srv, sim)) = best_unconfigured_match {
-            Err(format!("Found a {}% match on {}, but you do not have credentials configured for it.", sim, srv))
+            Err(format!("Found a {}% match on {}, but no credentials are set up for it. Add them in the Credentials tab", sim, srv))
         } else if highest_similarity > 0 {
-            Err(format!("Highest match found was {}%, which is below your {}% threshold.", highest_similarity, threshold))
+            Err(format!("Best match was {}%, below your {}% threshold", highest_similarity, threshold))
         } else {
-            Err("IQDB returned no matches for this image.".to_string())
+            Err("IQDB found no match".to_string())
         }
     }
 

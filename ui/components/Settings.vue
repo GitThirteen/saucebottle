@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 -->
 
 <script setup lang="ts">
-import { ref, watch, onMounted, onBeforeUnmount, computed, nextTick } from 'vue';
+import { ref, shallowRef, watch, onMounted, onBeforeUnmount, computed, nextTick } from 'vue';
 import draggable from 'vuedraggable';
 import { 
   GripVerticalIcon, 
@@ -27,11 +27,15 @@ import {
 } from 'lucide-vue-next';
 import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
+import { join, pictureDir } from '@tauri-apps/api/path';
 import { open, ask } from '@tauri-apps/plugin-dialog';
 import { enable, disable, isEnabled } from '@tauri-apps/plugin-autostart';
 import { openUrl } from '@tauri-apps/plugin-opener';
+import { check, type Update } from '@tauri-apps/plugin-updater';
 
-import { isPermanentScan, confidenceThreshold, autoUpdateEnabled } from '../store';
+import { isPermanentScan, confidenceThreshold, autoUpdateEnabled, appState, settingsSavedTick } from '../store';
+import { logger } from '../logger';
+import { installUpdate } from '../updater';
 
 // ---------------------------------*
 // ---- META & INTERNAL STATE ------*
@@ -55,6 +59,7 @@ const flags = ref({
   allowResizing: true,
   allowShrinking: true,
   startMinimized: false,
+  enableStats: false,
   allowImageConversion: true,
   listDupes: true,
   applyModsToSaved: false
@@ -74,6 +79,7 @@ const availableBlocks = ref([
 // -- File Handling & Directories --
 const renameBehavior = ref('site_id');
 const duplicateBehavior = ref('rename_copy');
+const inputFolder = ref('');
 const outputFolder = ref('');
 const originalFolder = ref('.original');
 const invalidFolder = ref('.invalid');
@@ -84,7 +90,7 @@ const downloadsFolder = ref('.downloads');
 // The text fields only commit on Enter / leaving the field (v-model.lazy), so half-typed paths
 // never become live. What's typed in the meantime is tracked here, so fields with edits that
 // haven't been saved yet can be highlighted.
-const textFields = { outputFolder, originalFolder, invalidFolder, downloadsFolder, blacklist };
+const textFields = { inputFolder, outputFolder, originalFolder, invalidFolder, downloadsFolder, blacklist };
 type TextField = keyof typeof textFields;
 const drafts = ref<Partial<Record<TextField, string>>>({});
 
@@ -101,6 +107,35 @@ const isUnsaved = (field: TextField) => {
 for (const [field, model] of Object.entries(textFields)) {
   watch(model, () => { delete drafts.value[field as TextField]; });
 }
+
+// -- Tag Blacklist Box --
+const blacklistEl = ref<HTMLTextAreaElement | null>(null);
+
+/** Grows the blacklist box to fit its text, but never below the minimum height from the CSS. */
+const autosizeBlacklist = () => {
+  const el = blacklistEl.value;
+  if (!el) return;
+
+  el.style.height = 'auto';
+  el.style.height = `${el.scrollHeight + (el.offsetHeight - el.clientHeight)}px`; // + the borders
+};
+
+/** Resizes the box while typing. The list is comma separated, so line breaks (also pasted ones) become spaces. */
+const onBlacklistInput = (e: Event) => {
+  const el = e.target as HTMLTextAreaElement;
+  if (/[\r\n]/.test(el.value)) el.value = el.value.replace(/[\r\n]+/g, ' ');
+
+  trackDraft('blacklist', e);
+  autosizeBlacklist();
+};
+
+/** Enter saves the field (like the other text fields) instead of adding a line break. */
+const commitOnEnter = (e: Event) => {
+  (e.target as HTMLTextAreaElement).blur();
+};
+
+// Also resize it when the value comes from the saved settings
+watch(blacklist, () => nextTick(autosizeBlacklist));
 
 // ---------------------------------*
 // ---- COMPUTED PROPERTIES --------*
@@ -133,8 +168,13 @@ const thresholdWarning = computed(() => {
 // ---- LIFECYCLE & WATCHERS -------*
 // ---------------------------------*
 
-onMounted(async () => {
-  // 1. Fetch saved config from the Rust backend
+/**
+ * Fills the form with the config the backend currently has.
+ * Auto-saving is paused meanwhile, so loading never writes anything back.
+ */
+const loadSettings = async () => {
+  isDataLoaded.value = false;
+
   try {
     const config: any = await invoke('get_config');
     hiddenServices.value = config.services || {};
@@ -151,6 +191,7 @@ onMounted(async () => {
       autoUpdateEnabled.value = config.flags.autoUpdateEnabled;
     }
 
+    inputFolder.value = config.input_folder || '';
     outputFolder.value = config.output_folder || '';
     originalFolder.value = config.original_folder || '.original';
     invalidFolder.value = config.invalid_folder || '.invalid';
@@ -164,6 +205,28 @@ onMounted(async () => {
 
   } catch (e) {
     console.error("Failed to load config, using defaults", e);
+  }
+};
+
+/** Turns `C:\Users\<name>\...` (or `/Users/<name>/...`, `/home/<name>/...`) into `C:\...`, so the placeholder doesn't show your user name. */
+const hideUserName = (path: string) =>
+  path.replace(/^([A-Za-z]:[\\/])Users[\\/][^\\/]+/, '$1...').replace(/^\/(?:Users|home)\/[^/]+/, '/...');
+
+/** Full paths the app uses while the folder fields are empty. Shown as placeholders. */
+const defaultInputPath = ref('');
+const defaultOutputPath = ref('');
+
+onMounted(async () => {
+  // 1. Fetch saved config from the Rust backend
+  await loadSettings();
+
+  // The fields need full paths, so show the real defaults instead of an example
+  try {
+    const root = await join(await pictureDir(), 'SauceBottle');
+    defaultInputPath.value = hideUserName(await join(root, 'input'));
+    defaultOutputPath.value = hideUserName(await join(root, 'results'));
+  } catch (e) {
+    console.warn("Could not resolve the default folders", e);
   }
 
   // 2. Fetch the compiled app version for the footer
@@ -199,6 +262,7 @@ const saveConfig = async () => {
     rename_behavior: renameBehavior.value,
     duplicate_behavior: duplicateBehavior.value,
     confidence_threshold: confidenceThreshold.value,
+    input_folder: inputFolder.value,
     output_folder: outputFolder.value,
     original_folder: originalFolder.value,
     invalid_folder: invalidFolder.value,
@@ -208,8 +272,14 @@ const saveConfig = async () => {
   
   try {
     await invoke('save_config', { config: payload });
+    settingsSavedTick.value++;
   } catch (e) {
     console.error("Failed to save config", e);
+
+    // The backend rejected the settings (e.g. an unusable input folder), so nothing was saved.
+    // Log why, and show the settings that are actually active again.
+    logger.error(`Settings not saved: ${e}`);
+    await loadSettings();
   }
 };
 
@@ -220,7 +290,7 @@ const saveConfig = async () => {
 watch(
   [
     isPermanentScan, autoUpdateEnabled, flags, activeHierarchy, availableBlocks, renameBehavior, 
-    duplicateBehavior, confidenceThreshold, outputFolder, originalFolder, 
+    duplicateBehavior, confidenceThreshold, inputFolder, outputFolder, originalFolder,
     invalidFolder, downloadsFolder, blacklist, autostart
   ], 
   () => {
@@ -273,21 +343,79 @@ const openExternalLink = async (url: string) => {
 };
 
 /**
- * Spawns the native OS directory selection dialog to pick an output folder.
+ * Spawns the native OS directory selection dialog to pick a folder for the given setting.
+ *
+ * @param target - The text field that receives the chosen path.
+ * @param title - The title of the dialog.
  */
-const pickOutputFolder = async () => {
+const pickFolder = async (target: 'inputFolder' | 'outputFolder', title: string) => {
   try {
     const selected = await open({
       directory: true,
       multiple: false,
-      title: 'Select Output Directory'
+      title
     });
 
     if (selected !== null) {
-      outputFolder.value = selected as string;
+      textFields[target].value = selected as string;
     }
   } catch (error) {
     console.error("Failed to open dialog:", error);
+  }
+};
+
+// ---------------------------------*
+// ---- UPDATES --------------------*
+// ---------------------------------*
+
+type UpdateCheckState = 'idle' | 'checking' | 'up-to-date' | 'available' | 'error';
+
+const updateCheck = ref<UpdateCheckState>('idle');
+const updateMessage = ref('');
+const foundUpdate = shallowRef<Update | null>(null);
+
+/**
+ * Checks GitHub for a newer release and shows the result next to the button.
+ * Installing is a separate step.
+ */
+const checkForUpdates = async () => {
+  updateCheck.value = 'checking';
+  foundUpdate.value = null;
+  updateMessage.value = '';
+
+  try {
+    const update = await check({ timeout: 15000 });
+
+    if (update) {
+      foundUpdate.value = update;
+      updateCheck.value = 'available';
+      updateMessage.value = `SauceBottle v${update.version} is available (you have v${appVersion.value}).`;
+      logger.info(`Update available: v${update.version}`);
+    } else {
+      updateCheck.value = 'up-to-date';
+      updateMessage.value = `SauceBottle is up to date (v${appVersion.value}).`;
+    }
+  } catch (e) {
+    console.error("Update check failed", e);
+    updateCheck.value = 'error';
+    updateMessage.value = `Could not check for updates: ${e}`;
+  }
+};
+
+/**
+ * Downloads and installs the update found by `checkForUpdates`, then restarts the app.
+ */
+const installFoundUpdate = async () => {
+  const update = foundUpdate.value;
+  if (!update) return;
+
+  try {
+    await installUpdate(update);
+  } catch (e) {
+    console.error("Update failed", e);
+    updateCheck.value = 'error';
+    updateMessage.value = `The update could not be installed: ${e}`;
+    logger.error(`Update to v${update.version} failed: ${e}`);
   }
 };
 
@@ -387,9 +515,16 @@ const handleApplyModsChange = async (e: Event) => {
           <span class="tooltip edge-right">Check for new versions of SauceBottle on startup.</span>
         </div>
       </label>
-      
+      <label class="checkbox-label">
+        <input type="checkbox" v-model="flags.enableStats" /> Collect statistics
+        <div class="info-wrapper">
+          <InfoIcon :size="14" class="info-icon" />
+          <span class="tooltip">Show sorting statistics on the start screen. Stored only on this computer, and only counted while this is on.</span>
+        </div>
+      </label>
+
       <div class="divider"></div>
-      
+
       <label class="checkbox-label">
         <input type="checkbox" v-model="flags.allowResizing" /> Allow Image Resizing
         <div class="info-wrapper">
@@ -541,6 +676,20 @@ const handleApplyModsChange = async (e: Event) => {
       <h4>Directories & Filters</h4>
 
       <div class="label-with-info">
+        <label class="input-label">Input Folder</label>
+        <div class="info-wrapper">
+          <InfoIcon :size="14" class="info-icon" />
+          <span class="tooltip">The folder that is watched for new images to sort. Leave empty to use the default (Pictures/SauceBottle/input).</span>
+        </div>
+      </div>
+      <div class="path-input-row">
+        <input type="text" class="text-input" v-model.lazy="inputFolder" :placeholder="defaultInputPath"
+          :class="{ unsaved: isUnsaved('inputFolder') }" @input="trackDraft('inputFolder', $event)" />
+        <button class="browse-btn" title="Browse" @click="pickFolder('inputFolder', 'Select Input Directory')">📁</button>
+      </div>
+      <p v-if="isUnsaved('inputFolder')" class="unsaved-hint">Not saved yet. Press Enter or click elsewhere to save.</p>
+
+      <div class="label-with-info">
         <label class="input-label">Output Folder</label>
         <div class="info-wrapper">
           <InfoIcon :size="14" class="info-icon" />
@@ -548,9 +697,9 @@ const handleApplyModsChange = async (e: Event) => {
         </div>
       </div>
       <div class="path-input-row">
-        <input type="text" class="text-input" v-model.lazy="outputFolder" placeholder="/path/to/output"
+        <input type="text" class="text-input" v-model.lazy="outputFolder" :placeholder="defaultOutputPath"
           :class="{ unsaved: isUnsaved('outputFolder') }" @input="trackDraft('outputFolder', $event)" />
-        <button class="browse-btn" title="Browse" @click="pickOutputFolder">📁</button>
+        <button class="browse-btn" title="Browse" @click="pickFolder('outputFolder', 'Select Output Directory')">📁</button>
       </div>
       <p v-if="isUnsaved('outputFolder')" class="unsaved-hint">Not saved yet. Press Enter or click elsewhere to save.</p>
 
@@ -594,9 +743,24 @@ const handleApplyModsChange = async (e: Event) => {
           <span class="tooltip">Tags to completely ignore when searching for Character, Fandom, or Artist names.</span>
         </div>
       </div>
-      <input type="text" class="text-input" v-model.lazy="blacklist" placeholder="comic, sketch..."
-        :class="{ unsaved: isUnsaved('blacklist') }" @input="trackDraft('blacklist', $event)" />
+      <textarea ref="blacklistEl" class="text-input blacklist-input" rows="3" v-model.lazy="blacklist" placeholder="comic, sketch..."
+        :class="{ unsaved: isUnsaved('blacklist') }" @input="onBlacklistInput" @keydown.enter.prevent="commitOnEnter"></textarea>
       <p v-if="isUnsaved('blacklist')" class="unsaved-hint">Not saved yet. Press Enter or click elsewhere to save.</p>
+    </div>
+
+    <div class="update-block">
+      <button class="update-bar" :disabled="updateCheck === 'checking' || appState === 'updating'" @click="checkForUpdates">
+        {{ updateCheck === 'checking' ? 'Checking...' : 'Check for updates' }}
+      </button>
+      <p v-if="updateMessage" class="update-message" :class="['update-' + updateCheck, { floating: updateCheck !== 'available' }]" :title="updateMessage">{{ updateMessage }}</p>
+
+      <template v-if="updateCheck === 'available' && foundUpdate">
+        <pre v-if="foundUpdate.body" class="update-notes">{{ foundUpdate.body }}</pre>
+        <p class="update-procedure">Installing downloads the update, installs it and restarts SauceBottle.</p>
+        <button class="update-bar primary" :disabled="appState === 'updating'" @click="installFoundUpdate">
+          Install v{{ foundUpdate.version }} &amp; restart
+        </button>
+      </template>
     </div>
 
     <div class="about-footer unselectable">
@@ -677,6 +841,24 @@ h4 { color: var(--text-primary); margin-bottom: 12px; font-weight: 800; font-siz
 .input-label { display: block; font-size: 0.85rem; font-weight: 600; color: var(--text-secondary); margin-bottom: 5px; margin-top: 15px; }
 .checkbox-label { margin-bottom: 8px; display: flex; align-items: center; gap: 6px; color: var(--text-primary); font-size: 0.9rem; font-weight: 600; cursor: pointer; width: max-content; }
 .checkbox-label input[type="checkbox"] { accent-color: var(--accent-primary); width: 16px; height: 16px; margin-right: 4px;}
+
+/* Tag blacklist: wraps long lists and grows with its text (see autosizeBlacklist) */
+.blacklist-input { display: block; resize: none; overflow: hidden; min-height: 84px; line-height: 1.4; }
+
+/* Update check */
+.update-block { position: relative; display: flex; flex-direction: column; gap: 10px; }
+.update-bar { width: 100%; padding: 14px 20px; background: var(--bg-surface); color: var(--text-primary); border: 1px solid var(--bg-surface-elevated); border-radius: 12px; cursor: pointer; font-family: 'Nunito', sans-serif; font-weight: 800; font-size: 0.95rem; transition: border-color 0.2s; }
+.update-bar:hover:not(:disabled) { border-color: var(--accent-primary); }
+.update-bar:disabled { opacity: 0.6; cursor: default; }
+.update-bar.primary { background: var(--accent-gradient); border-color: transparent; color: white; }
+.update-message { margin: 0; text-align: center; font-size: 0.8rem; font-weight: 600; color: var(--text-secondary); }
+/* The status line sits in the gap above the footer, so it doesn't push anything down */
+.update-message.floating { position: absolute; top: 100%; left: 0; right: 0; margin-top: 8px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.update-message.update-up-to-date { color: var(--success, #00e676); }
+.update-message.update-available { color: #f5c542; }
+.update-message.update-error { color: #ff4d4d; }
+.update-notes { margin: 0; max-height: 120px; overflow-y: auto; width: 100%; box-sizing: border-box; padding: 10px 12px; background: var(--bg-surface); border-radius: 6px; font-family: 'Nunito', sans-serif; font-size: 0.75rem; color: var(--text-secondary); white-space: pre-wrap; word-break: break-word; }
+.update-procedure { margin: 0; text-align: center; font-size: 0.75rem; color: var(--text-tertiary); }
 
 .path-input-row { display: flex; gap: 8px; align-items: center; }
 .path-input-row .text-input { flex: 1; }

@@ -15,11 +15,13 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
+use tauri::{AppHandle, Manager};
 
 use crate::models::AppConfig;
+use crate::storage;
 
 // ---------------------------------*
 // ---- CONFIG.RS ------------------*
@@ -131,6 +133,80 @@ fn merge_with_defaults(raw: Map<String, Value>) -> (AppConfig, Vec<String>) {
 
     let config = serde_json::from_value(Value::Object(merged)).unwrap_or(defaults);
     (config, reset_keys)
+}
+
+/// SauceBottle's default root folder: `<Pictures>/SauceBottle`.
+pub fn default_root(handle: &AppHandle) -> PathBuf {
+    handle
+        .path()
+        .picture_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("SauceBottle")
+}
+
+/// The folder that is watched for new images: the configured one, or `<Pictures>/SauceBottle/input`.
+pub fn input_dir(handle: &AppHandle, config: &AppConfig) -> PathBuf {
+    let custom = config.input_folder.trim();
+    if custom.is_empty() {
+        default_root(handle).join("input")
+    } else {
+        PathBuf::from(custom)
+    }
+}
+
+/// The folder sorted images are written to: the configured one, or `<Pictures>/SauceBottle/results`.
+pub fn results_dir(handle: &AppHandle, config: &AppConfig) -> PathBuf {
+    if config.output_folder.trim().is_empty() {
+        default_root(handle).join("results")
+    } else {
+        PathBuf::from(&config.output_folder)
+    }
+}
+
+/// Checks that the configured input folder is usable and creates it if needed.
+/// The default folder is created at startup, so there's nothing to check for it.
+///
+/// The output folder can't be inside the input folder. The input folder is watched recursively,
+/// so sorted images would be picked up and sorted again, over and over.
+///
+/// # Returns
+/// * `Result<(), String>` - A message for the user if the folder can't be used.
+pub fn validate_input_folder(handle: &AppHandle, config: &AppConfig) -> Result<(), String> {
+    let custom = config.input_folder.trim();
+    if custom.is_empty() {
+        return Ok(());
+    }
+
+    let input = PathBuf::from(custom);
+    if !input.is_absolute() {
+        return Err(format!("The input folder must be a full path (e.g. C:\\Images\\Inbox), but got '{}'.", custom));
+    }
+
+    // A network share that is switched off blocks the call below for about 20 seconds and freezes
+    // the window, so check with a time limit first
+    if !storage::is_reachable(&input, storage::PROBE_TIMEOUT) {
+        return Err(format!("The input folder '{}' can't be reached. Check that the drive or network share is connected.", custom));
+    }
+
+    fs::create_dir_all(&input)
+        .map_err(|e| format!("Could not create the input folder '{}': {}", custom, e))?;
+    if !input.is_dir() {
+        return Err(format!("The input folder '{}' is not a folder.", custom));
+    }
+
+    // Both folders need to exist so their canonical paths can be compared (this resolves '..', links and casing)
+    let results = results_dir(handle, config);
+    if storage::is_reachable(&results, storage::PROBE_TIMEOUT) {
+        let _ = fs::create_dir_all(&results);
+    }
+    let input = fs::canonicalize(&input).unwrap_or(input);
+    let results = fs::canonicalize(&results).unwrap_or(results);
+
+    if results.starts_with(&input) {
+        return Err("The output folder can't be the input folder or inside of it, because sorted images would be picked up again.".to_string());
+    }
+
+    Ok(())
 }
 
 /// Writes the config to disk without ever leaving a half-written file behind:

@@ -40,6 +40,8 @@ pub struct AppConfig {
     pub flags: HashMap<String, bool>,
 
     // Directory Settings
+    /// Folder that is watched for new images. Empty = `<Pictures>/SauceBottle/input`.
+    pub input_folder: String,
     pub output_folder: String,
     pub original_folder: String,
     pub invalid_folder: String,
@@ -87,6 +89,7 @@ impl Default for AppConfig {
         flags.insert("isPermanentScan".to_string(), true);
         flags.insert("allowResizing".to_string(), true);
         flags.insert("autoUpdateEnabled".to_string(), true);
+        flags.insert("enableStats".to_string(), false);
 
         let active_hierarchy = vec![
             HierarchyBlock { id: 1, name: "Fandom".to_string() },
@@ -102,6 +105,7 @@ impl Default for AppConfig {
         Self {
             services,
             flags,
+            input_folder: "".to_string(),
             output_folder: "".to_string(),
             original_folder: ".original".to_string(),
             invalid_folder: ".invalid".to_string(),
@@ -129,6 +133,19 @@ pub struct BooruResponse {
     pub file_path: String,
     /// True if the work has no known fandom and was filed under the "original artwork" folder.
     pub is_original_work: bool,
+    /// Name of the file that was sorted (as it was named in the input folder).
+    pub source_file: String,
+}
+
+/// Sent to the frontend when an image could not be sorted.
+#[derive(Debug, Clone, Serialize)]
+pub struct Failure {
+    /// Name of the image the failure is about.
+    pub file: String,
+    /// What went wrong. Gets shown right after the file name.
+    pub message: String,
+    /// The folder the image was moved to (`None` if it stayed where it was).
+    pub moved_to: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

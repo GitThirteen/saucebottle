@@ -17,9 +17,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 -->
 
 <script setup lang="ts">
-import { ref, watch, onUnmounted, computed } from 'vue';
-import { DropletIcon, AlertTriangleIcon, DownloadCloudIcon, ClockIcon } from 'lucide-vue-next';
+import { ref, watch, onActivated, onUnmounted, computed } from 'vue';
+import { DropletIcon, AlertTriangleIcon, DownloadCloudIcon, ClockIcon, RotateCcwIcon, BarChart3Icon, ChevronLeftIcon, ChevronRightIcon } from 'lucide-vue-next';
 import { invoke } from '@tauri-apps/api/core';
+import { ask } from '@tauri-apps/plugin-dialog';
+import { logger } from '../logger';
 import { join, pictureDir, dirname } from '@tauri-apps/api/path';
 import { 
   appState, 
@@ -32,7 +34,8 @@ import {
   offlineQueueCount, 
   isPermanentScan,
   updateStatus,
-  updateProgress
+  updateProgress,
+  settingsSavedTick
 } from '../store';
 
 // ---------------------------------*
@@ -80,8 +83,136 @@ const badgeClass = computed(() => {
   return 'badge-green';
 });
 
+// ---------------------------------*
+// ---- STATISTICS -----------------*
+// ---------------------------------*
+
+interface TopEntry { name: string; detail: string | null; count: number }
+interface StatsView {
+  enabled: boolean;
+  sorted: number;
+  originals: number;
+  failed: number;
+  top_character: TopEntry | null;
+  top_fandom: TopEntry | null;
+  top_artist: TopEntry | null;
+  top_service: TopEntry | null;
+  average_confidence: number | null;
+  size_kb: number;
+  average_sort_millis: number | null;
+  saved_millis: number;
+  downloads: number;
+}
+
+const stats = ref<StatsView | null>(null);
+
+const refreshStats = async () => {
+  try {
+    stats.value = await invoke<StatsView>('get_stats');
+  } catch (e) {
+    console.warn('Could not load statistics', e);
+  }
+};
+
+const formatSize = (kb: number) => {
+  if (kb < 1024) return `${kb} KB`;
+  if (kb < 1024 * 1024) return `${(kb / 1024).toFixed(1)} MB`;
+  return `${(kb / 1024 / 1024).toFixed(2)} GB`;
+};
+
+const formatDuration = (totalSeconds: number) => {
+  const seconds = Math.round(totalSeconds);
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} h ${minutes % 60} min`;
+  return `${Math.floor(hours / 24)} d ${hours % 24} h`;
+};
+
+/** Tile for the most frequent name of one kind (character, fandom, ...). */
+const topTile = (label: string, entry: TopEntry | null) => ({
+  label,
+  value: entry ? entry.name : '–',
+  // The fandom goes under the character's name, so same-named characters can be told apart
+  sub: entry ? (entry.detail ? `×${entry.count} · ${entry.detail}` : `×${entry.count}`) : '',
+  title: entry ? `${entry.name}${entry.detail ? ` (${entry.detail})` : ''}: ${entry.count}×` : '',
+});
+
+/** Tiles per page. This is one row of the grid. The order below is the page order. */
+const STATS_TILES_PER_PAGE = 3;
+
+const tiles = computed(() => {
+  const s = stats.value;
+  if (!s) return [];
+
+  const none = '–';
+  const avgTime = s.average_sort_millis === null ? none
+    : s.average_sort_millis < 1000 ? `${s.average_sort_millis} ms`
+    : `${(s.average_sort_millis / 1000).toFixed(1)} s`;
+  const attempts = s.sorted + s.failed;
+
+  return [
+    // Page 1
+    { label: 'Images sorted', value: s.sorted.toLocaleString(), sub: '', title: '' },
+    { label: 'Confidence', value: s.average_confidence === null ? none : `${s.average_confidence.toFixed(1)}%`, sub: '', title: 'Average match confidence of the sorted images' },
+    {
+      label: 'Success rate',
+      value: attempts === 0 ? none : `${Math.round((s.sorted / attempts) * 100)}%`,
+      sub: attempts === 0 ? '' : `${s.failed} failed`,
+      title: 'Images that were sorted, out of all images that were processed',
+    },
+    // Page 2
+    topTile('Top character', s.top_character),
+    topTile('Top fandom', s.top_fandom),
+    topTile('Top artist', s.top_artist),
+    // Page 3
+    { label: 'Storage', value: formatSize(s.size_kb), sub: '', title: 'Total size of the sorted images' },
+    { label: 'Time per image', value: avgTime, sub: '', title: 'Average time from the start of processing to the finished sort' },
+    { label: 'Originals', value: s.originals.toLocaleString(), sub: '', title: 'Sorted images that are original works' },
+    // Page 4
+    topTile('Top service', s.top_service),
+    { label: 'Downloads', value: s.downloads.toLocaleString(), sub: '', title: '' },
+    { label: 'Time saved', value: formatDuration(s.saved_millis / 1000), sub: '', title: 'Per sorted image: 30 s of manual sorting minus the time SauceBottle needed (never less than zero)' },
+  ];
+});
+
+const statsPage = ref(0);
+
+const statsPageCount = computed(() => Math.max(1, Math.ceil(tiles.value.length / STATS_TILES_PER_PAGE)));
+const visibleTiles = computed(() => {
+  const page = Math.min(statsPage.value, statsPageCount.value - 1);
+  return tiles.value.slice(page * STATS_TILES_PER_PAGE, (page + 1) * STATS_TILES_PER_PAGE);
+});
+
+const resetStats = async () => {
+  const message = 'This permanently deletes all your statistics and starts counting from zero. Your sorted images are not touched.\n\nReset statistics?';
+  let confirmed = false;
+  try {
+    confirmed = await ask(message, { title: 'Reset Statistics', kind: 'warning' });
+  } catch {
+    confirmed = window.confirm(message);
+  }
+  if (!confirmed) return;
+
+  try {
+    await invoke('reset_stats');
+  } catch (e) {
+    logger.error(`Could not reset statistics: ${e}`);
+  }
+  await refreshStats();
+};
+
+// This view stays alive when you switch tabs, so refresh on every visit (this also covers the first one) ...
+onActivated(refreshStats);
+// ... and after settings were saved, e.g. "Collect statistics" switched on or off
+watch(settingsSavedTick, refreshStats);
+
 watch(appState, (newState) => {
   clearInterval(tipInterval);
+
+  // Pick up what was sorted in the meantime
+  if (newState === 'welcome') refreshStats();
 
   if (newState === 'updating') {
     tipInterval = window.setInterval(() => {
@@ -157,6 +288,11 @@ const openDestinationFolder = async () => {
   }
 };
 
+/** Hides the "servers are busy" banner and moves the card back up. It can show again for the next image. */
+const dismissSlowNetworkBanner = () => {
+  isSlowNetwork.value = false;
+};
+
 const handleImageError = () => {
   currentKaomoji.value = kaomojis[Math.floor(Math.random() * kaomojis.length)];
   isImageMovedTooFast.value = true;
@@ -165,6 +301,28 @@ const handleImageError = () => {
 
 <template>
   <div class="main-view">
+    <!-- Sits above the card. Its height is animated, so the card slides down to make room and back up when dismissed -->
+    <transition name="banner-slide">
+      <div v-if="isSlowNetwork" class="banner-slot">
+        <div class="banner-slot-inner">
+          <div
+            class="slow-network-banner unselectable"
+            role="button"
+            tabindex="0"
+            title="Click to dismiss"
+            @click="dismissSlowNetworkBanner"
+            @keydown.enter="dismissSlowNetworkBanner"
+          >
+            <ClockIcon :size="24" class="banner-icon" />
+            <div class="banner-text">
+              <h3>Taking Longer Than Usual</h3>
+              <p>The IQDB servers are handling a lot of orders right now. Please be patient, your sauce will be out shortly.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </transition>
+
     <transition name="fade" mode="out-in">
       <div v-if="appState === 'welcome'" class="welcome-card unselectable">
         <div class="icon-ring organic-blob">
@@ -281,12 +439,45 @@ const handleImageError = () => {
       </div>
     </transition>
 
-    <transition name="toast-pop">
-      <div v-if="isSlowNetwork" class="slow-network-banner unselectable">
-        <ClockIcon :size="20" class="pulse-icon banner-icon" />
-        <span>The IQDB servers are handling a lot of orders right now. Please be patient, your sauce will be out shortly.</span>
+    <!-- Optional statistics, welcome screen only. Shows a note while they're off -->
+    <transition name="stats-fade">
+      <div v-if="appState === 'welcome' && stats" class="stats-card unselectable">
+        <div v-if="!stats.enabled" class="stats-off">
+          <BarChart3Icon :size="26" class="stats-off-icon" />
+          <span class="stats-off-title">Statistics are off</span>
+          <span class="stats-off-text">Tick <b>Collect statistics</b> in the settings to see your sorting numbers here.</span>
+        </div>
+
+        <template v-else>
+          <div class="stats-header">
+            <h3>Statistics</h3>
+            <div class="stats-controls">
+              <template v-if="statsPageCount > 1">
+                <button class="stats-icon-btn" :disabled="statsPage === 0" title="Previous" aria-label="Previous page" @click="statsPage--">
+                  <ChevronLeftIcon :size="14" />
+                </button>
+                <span class="stats-page">{{ statsPage + 1 }} / {{ statsPageCount }}</span>
+                <button class="stats-icon-btn" :disabled="statsPage >= statsPageCount - 1" title="Next" aria-label="Next page" @click="statsPage++">
+                  <ChevronRightIcon :size="14" />
+                </button>
+              </template>
+              <button class="stats-icon-btn" title="Reset statistics" aria-label="Reset statistics" @click="resetStats">
+                <RotateCcwIcon :size="14" />
+              </button>
+            </div>
+          </div>
+
+          <div class="stats-grid">
+            <div v-for="tile in visibleTiles" :key="tile.label" class="stats-tile" :title="tile.title">
+              <span class="stats-value">{{ tile.value }}</span>
+              <span v-if="tile.sub" class="stats-sub">{{ tile.sub }}</span>
+              <span class="stats-label">{{ tile.label }}</span>
+            </div>
+          </div>
+        </template>
       </div>
     </transition>
+
   </div>
 </template>
 
@@ -297,8 +488,14 @@ const handleImageError = () => {
   flex-direction: column; 
   gap: 20px; 
   box-sizing: border-box; 
-  height: 100%; 
-  justify-content: center; 
+  height: 100%;
+  justify-content: flex-start;
+}
+
+/* Cards and the banner must never shrink to fit the tab, the tab scrolls instead. Without this,
+   the card (overflow: hidden) shrinks below its content as soon as the banner takes space. */
+.main-view > * {
+  flex-shrink: 0;
 }
 
 .spacer {
@@ -396,18 +593,17 @@ const handleImageError = () => {
 /* -- WELCOME SCREEN -- */
 .welcome-card { 
   background: var(--bg-surface); 
-  border-radius: 16px; 
-  padding: 40px 20px; 
-  text-align: center; 
-  box-shadow: 0 8px 30px rgba(0,0,0,0.3); 
-  border: 1px dashed var(--bg-surface-elevated); 
-  display: flex; 
-  flex-direction: column; 
-  align-items: center; 
-  justify-content: center; 
+  border-radius: 12px;
+  padding: 40px 20px;
+  text-align: center;
+  border: 1px solid var(--bg-surface-elevated);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
 }
 
-.icon-ring { 
+.icon-ring {
   width: 70px; 
   height: 70px; 
   border-radius: 50%; 
@@ -446,12 +642,63 @@ const handleImageError = () => {
   font-size: 0.85rem; 
 }
 
+/* -- STATISTICS CARD (welcome screen only) -- */
+.stats-card {
+  background: var(--bg-surface);
+  border-radius: 12px;
+  padding: 14px;
+  border: 1px solid var(--bg-surface-elevated);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.stats-header { display: flex; align-items: center; justify-content: space-between; }
+.stats-header h3 { margin: 0; font-size: 1.05rem; color: var(--text-primary); }
+
+.stats-controls { display: flex; align-items: center; gap: 6px; }
+.stats-page { min-width: 34px; text-align: center; color: var(--text-secondary); font-size: 0.72rem; font-weight: 700; }
+
+.stats-icon-btn {
+  display: flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; padding: 0;
+  background: transparent; color: var(--text-tertiary);
+  border: 1px solid var(--bg-surface-elevated); border-radius: 6px;
+  cursor: pointer; transition: color 0.2s, border-color 0.2s;
+}
+.stats-icon-btn:hover:not(:disabled) { color: var(--text-primary); border-color: var(--accent-primary); }
+
+.stats-off { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 10px 0 4px; text-align: center; }
+.stats-off-icon { color: var(--text-tertiary); margin-bottom: 4px; }
+.stats-off-title { color: var(--text-primary); font-weight: 800; font-size: 0.95rem; }
+.stats-off-text { color: var(--text-secondary); font-size: 0.85rem; line-height: 1.5; max-width: 280px; }
+.stats-off-text b { color: var(--text-primary); }
+
+.stats-icon-btn:disabled { opacity: 0.35; cursor: default; }
+
+/* All tiles have the same size: equal columns, fixed row height */
+.stats-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); grid-auto-rows: 60px; gap: 8px; }
+.stats-tile {
+  display: flex; flex-direction: column; gap: 1px; min-width: 0; min-height: 0; box-sizing: border-box;
+  padding: 8px 10px; background: var(--bg-base); border-radius: 8px;
+}
+.stats-value { color: var(--text-primary); font-weight: 800; font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stats-sub { color: var(--text-secondary); font-size: 0.62rem; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stats-label { margin-top: auto; padding-top: 2px; color: var(--text-tertiary); font-size: 0.58rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Fades in a bit after the welcome card, so it doesn't pop up while the previous card is still leaving */
+.stats-fade-enter-active { transition: opacity 0.3s ease 0.3s; }
+.stats-fade-leave-active { transition: opacity 0.3s ease; }
+.stats-fade-enter-from, .stats-fade-leave-to { opacity: 0; }
+
 /* -- PROCESSING CARD (Shared wrapper) -- */
 .processing-card { 
   background: var(--bg-surface); 
   border-radius: 12px; 
-  box-shadow: 0 8px 30px rgba(0,0,0,0.5); 
-  border: 1px solid var(--bg-surface-elevated); 
+  box-shadow: 0 8px 30px rgba(0,0,0,0.5);
+  border: 1px solid var(--bg-surface-elevated);
+  /* Clips the children to the rounded corners. The queue bar's square background covered the border there */
+  overflow: hidden;
 }
 
 /* Top Status Bar & Image */
@@ -663,51 +910,92 @@ const handleImageError = () => {
   max-width: 90%; 
 }
 
+/* -- SLOW NETWORK BANNER -- */
+/* Sits above the card. The slot's height is animated (0fr -> 1fr), so the card below slides down
+   to make room and back up when the banner goes away. */
+.banner-slot {
+  display: grid;
+  grid-template-rows: 1fr;
+  /* Cancels the flex gap of the container. The spacing below the banner is part of the slot's own
+     (animated) height instead, so nothing jumps when the slot appears or disappears. */
+  margin-bottom: -20px;
+  /* The container's top padding is 20px, but with the banner shown only 12px should be above it
+     (the same as below it). Animated together with the height, see the transition below. */
+  margin-top: -8px;
+}
+
+.banner-slot-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Same layout as the info banner in the Credentials tab, in the warning colors */
 .slow-network-banner {
-  position: fixed;
-  top: 80px;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 100;
-  
-  width: calc(100% - 20px);
   box-sizing: border-box;
-  
+  margin-bottom: 12px; /* the space between banner and card */
+
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 16px;
-  background: rgba(245, 197, 66, 0.15);
+  gap: 15px;
+  background: rgba(245, 197, 66, 0.1);
+  border: 1px solid rgba(245, 197, 66, 0.3);
+  padding: 15px;
+  border-radius: 8px;
+
+  cursor: pointer;
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+
+.slow-network-banner .banner-text {
+  flex: 1;
+}
+
+.slow-network-banner .banner-text h3 {
+  margin: 0 0 5px 0;
+  font-size: 0.95rem;
   color: #f5c542;
-  padding: 12px 18px;
-  
-  border-radius: 12px; 
-  border: 1px dashed rgba(245, 197, 66, 0.3);
-  backdrop-filter: blur(8px); 
-  
-  text-align: center;
-  font-size: 0.75rem;
-  font-weight: 700;
-  line-height: 1.5;
+}
+
+.slow-network-banner .banner-text p {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+.slow-network-banner:hover,
+.slow-network-banner:focus-visible {
+  background: rgba(245, 197, 66, 0.16);
+  border-color: rgba(245, 197, 66, 0.5);
+  outline: none;
 }
 
 .banner-icon {
+  color: #f5c542;
   flex-shrink: 0;
 }
 
-.toast-pop-enter-active, 
-.toast-pop-leave-active {
-  transition: opacity 0.3s ease, transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+.banner-slide-enter-active,
+.banner-slide-leave-active {
+  transition: grid-template-rows 0.5s cubic-bezier(0.22, 1, 0.36, 1), margin-top 0.5s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.35s ease;
 }
 
-.toast-pop-enter-from, 
-.toast-pop-leave-to {
+.banner-slide-enter-from,
+.banner-slide-leave-to {
+  grid-template-rows: 0fr;
+  margin-top: 0;
   opacity: 0;
-  transform: translate(-50%, -20px); 
 }
 
-.pulse-icon {
-  animation: pulse-anim 2s infinite;
+/* The banner itself slides in from above while the space opens up */
+.banner-slide-enter-active .slow-network-banner,
+.banner-slide-leave-active .slow-network-banner {
+  transition: transform 0.5s cubic-bezier(0.22, 1, 0.36, 1), background 0.2s ease, border-color 0.2s ease;
+}
+
+.banner-slide-enter-from .slow-network-banner,
+.banner-slide-leave-to .slow-network-banner {
+  transform: translateY(-16px);
 }
 
 /* -- RARE EASTER EGG TEXT -- */
